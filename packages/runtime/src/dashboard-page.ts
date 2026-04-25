@@ -270,7 +270,7 @@ export function buildDashboardPage(): string {
 
     .focus-grid {
       display: grid;
-      grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
+      grid-template-columns: minmax(0, 1fr);
       gap: 12px;
     }
     .focus-card {
@@ -280,7 +280,6 @@ export function buildDashboardPage(): string {
       gap: 10px;
       border-left: 2px solid #d4ded8;
     }
-    .focus-card.secondary { border-left-color: #dad7cd; }
     .focus-title {
       margin: 0;
       font-size: 1.08rem;
@@ -312,15 +311,6 @@ export function buildDashboardPage(): string {
       overflow-wrap: anywhere;
       line-height: 1.32;
     }
-    .look-next {
-      padding: 12px;
-      border-radius: var(--radius);
-      border: 1px solid #faedcd;
-      background: var(--amber-soft);
-      color: #594116;
-      line-height: 1.4;
-    }
-
     .content-grid {
       display: grid;
       gap: 16px;
@@ -906,16 +896,12 @@ export function buildDashboardPage(): string {
     function renderCurrentFocus(activeTasks, capsules, initiatives, live) {
       const current = activeTasks.find(task => normalizeStatus(task.status) === 'in_progress') || activeTasks[0] || null;
       if (!current) {
-        return '<div class="focus-card"><h4 class="focus-title">No active task reported</h4><div class="subtle">The task pool has no assigned or in-progress work. Check the task board and recent events for whether the run is waiting for new work.</div></div>' +
-          '<div class="focus-card secondary"><h4 class="focus-title">Next operator check</h4><div class="look-next">Confirm whether this is an idle steady state or whether the CEO agent should create the next task.</div></div>';
+        return '<div class="focus-card"><h4 class="focus-title">No active task reported</h4><div class="subtle">The task pool has no assigned or in-progress work.</div></div>';
       }
       const capsule = findCapsuleForTask(current, capsules);
       const initiative = findInitiative(current.initiativeId, initiatives);
       const prLinks = extractPrLinks(current.result);
       const branch = capsule?.branch || live.brain || 'No branch reported';
-      const next = normalizeStatus(current.status) === 'in_progress'
-        ? 'Watch the active agent, branch, and recent events for completion or blocker messages.'
-        : 'Task is assigned but not yet in progress; watch whether the owner agent starts or reports a blocker.';
 
       return '<div class="focus-card">' +
         '<div class="task-meta">' + statusBadge(current.status, true) + '<span class="pill">Owner ' + escape(current.assignee || 'unassigned') + '</span>' + (current.priority ? '<span class="pill">P' + escape(String(current.priority)) + '</span>' : '') + '</div>' +
@@ -927,8 +913,7 @@ export function buildDashboardPage(): string {
           '<div class="detail-item"><div class="detail-label">Scope</div><div class="detail-value mono">' + escape(formatScope(current.scope)) + '</div></div>' +
           '<div class="detail-item full"><div class="detail-label">PR / Result</div><div class="detail-value">' + (prLinks.length ? prLinks.map(link => '<span class="pill mono">' + escape(link.replace('https://github.com/', '')) + '</span>').join(' ') : escape(current.result || 'No PR or result reported yet')) + '</div></div>' +
         '</div>' +
-      '</div>' +
-      '<div class="focus-card secondary"><h4 class="focus-title">What to inspect next</h4><div class="look-next">' + escape(next) + '</div></div>';
+      '</div>';
     }
 
     function taskCard(task) {
@@ -1309,7 +1294,7 @@ export function buildDashboardPage(): string {
               <div class="panel-header">
                 <div>
                   <h3>Current Focus</h3>
-                  <div class="panel-subtitle">The active task, owner, branch/brain, capsule, scope, and what the human should inspect next.</div>
+                  <div class="panel-subtitle">The active task, owner, branch/brain, capsule, scope, and PR/result metadata.</div>
                 </div>
               </div>
               <div class="focus-grid" id="focus"></div>
