@@ -793,7 +793,7 @@ describe('Supervisor', () => {
 
     it('caps dashboard event history for long-running supervisors', () => {
       const bus = supervisor.initEventBus('run-dashboard-capped')
-      for (let loop = 1; loop <= 260; loop++) {
+      for (let loop = 1; loop <= 60; loop++) {
         bus.emit({
           type: 'loop.tick',
           runId: 'run-dashboard-capped',
@@ -811,10 +811,10 @@ describe('Supervisor', () => {
       }
 
       const data = supervisor.getDashboardData()
-      expect(data.live.events).toHaveLength(500)
+      expect(data.live.events).toHaveLength(100)
       const firstRaw = JSON.parse(data.live.events[0]!.raw) as { loop: number }
       expect(firstRaw.loop).toBeGreaterThan(1)
-      expect(data.live.events[499]?.raw).toContain('"pendingMessages":260')
+      expect(data.live.events[99]?.raw).toContain('"pendingMessages":60')
     })
 
     it('replays full current-run history to dashboard stream subscribers before live events', () => {

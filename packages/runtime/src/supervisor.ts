@@ -99,7 +99,7 @@ interface DashboardAuditEntry {
 
 const ANSI_PATTERN = /\x1B\[[0-?]*[ -/]*[@-~]/g;
 const DASHBOARD_AUDIT_TAIL_BYTES = 128 * 1024;
-const DASHBOARD_EVENT_HISTORY_LIMIT = 500;
+const DASHBOARD_EVENT_HISTORY_LIMIT = 100;
 
 function stripAnsi(value: string): string {
   return value.replace(ANSI_PATTERN, '');
