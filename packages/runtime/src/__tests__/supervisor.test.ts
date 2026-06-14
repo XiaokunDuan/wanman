@@ -760,17 +760,22 @@ describe('Supervisor', () => {
   })
 
   describe('dashboard event history', () => {
-    it('surfaces full live event history from the supervisor event bus', () => {
+    it('surfaces bounded live event history from the supervisor event bus', () => {
       const bus = supervisor.initEventBus('run-dashboard')
       for (let loop = 1; loop <= 15; loop++) {
-        bus.tick()
+        bus.emit({
+          type: 'loop.tick',
+          runId: 'run-dashboard',
+          loop,
+          timestamp: new Date(`2026-04-25T09:00:${String(loop * 2 - 1).padStart(2, '0')}.000Z`).toISOString(),
+        })
         bus.emit({
           type: 'queue.backlog',
           runId: 'run-dashboard',
           loop,
           agent: 'echo',
           pendingMessages: loop,
-          timestamp: new Date(`2026-04-25T09:00:${String(loop).padStart(2, '0')}.000Z`).toISOString(),
+          timestamp: new Date(`2026-04-25T09:00:${String(loop * 2).padStart(2, '0')}.000Z`).toISOString(),
         })
       }
 
@@ -784,6 +789,32 @@ describe('Supervisor', () => {
       expect(data.live.eventSource).toBe('supervisor-event-bus')
       expect(data.live.streamAvailable).toBe(true)
       expect(data.healthChecks).toContainEqual({ label: 'Runtime event stream', status: 'active' })
+    })
+
+    it('caps dashboard event history for long-running supervisors', () => {
+      const bus = supervisor.initEventBus('run-dashboard-capped')
+      for (let loop = 1; loop <= 260; loop++) {
+        bus.emit({
+          type: 'loop.tick',
+          runId: 'run-dashboard-capped',
+          loop,
+          timestamp: new Date(1777107600000 + loop * 2000 - 1000).toISOString(),
+        })
+        bus.emit({
+          type: 'queue.backlog',
+          runId: 'run-dashboard-capped',
+          loop,
+          agent: 'echo',
+          pendingMessages: loop,
+          timestamp: new Date(1777107600000 + loop * 2000).toISOString(),
+        })
+      }
+
+      const data = supervisor.getDashboardData()
+      expect(data.live.events).toHaveLength(500)
+      const firstRaw = JSON.parse(data.live.events[0]!.raw) as { loop: number }
+      expect(firstRaw.loop).toBeGreaterThan(1)
+      expect(data.live.events[499]?.raw).toContain('"pendingMessages":260')
     })
 
     it('replays full current-run history to dashboard stream subscribers before live events', () => {
@@ -888,6 +919,73 @@ describe('Supervisor', () => {
         })
         expect(data.live.note).toContain('runtime audit log')
         expect(data.healthChecks).toContainEqual({ label: 'Runtime audit log', status: 'active' })
+      } finally {
+        fs.rmSync(overlayRoot, { recursive: true, force: true })
+      }
+    })
+
+    it('tails runtime audit logs instead of reading the whole file into dashboard data', () => {
+      const overlayRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wanman-dashboard-audit-tail-'))
+      const workspaceRoot = path.join(overlayRoot, 'workspace')
+      fs.mkdirSync(workspaceRoot, { recursive: true })
+      const oldLines = Array.from({ length: 6000 }, (_, index) =>
+        `08:00:${String(index % 60).padStart(2, '0')} supervisor old-line-${index}`,
+      )
+      fs.writeFileSync(
+        path.join(overlayRoot, 'runtime-audit.log'),
+        [
+          ...oldLines,
+          '{"ts":"2026-04-25T09:00:00.000Z","level":"info","scope":"agent-process","msg":"tail marker","agent":"dev"}',
+        ].join('\n'),
+      )
+      const sv = new Supervisor(makeConfig({ workspaceRoot }))
+
+      try {
+        const data = sv.getDashboardData()
+        expect(data.live.raw.length).toBeLessThan(130 * 1024)
+        expect(data.live.raw).not.toContain('old-line-0')
+        expect(data.live.events.at(-1)).toMatchObject({
+          source: 'runtime-audit',
+          kind: 'agent-process',
+          message: 'tail marker',
+        })
+      } finally {
+        fs.rmSync(overlayRoot, { recursive: true, force: true })
+      }
+    })
+
+    it('merges runtime audit and event-bus history by timestamp', () => {
+      const overlayRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wanman-dashboard-audit-order-'))
+      const workspaceRoot = path.join(overlayRoot, 'workspace')
+      fs.mkdirSync(workspaceRoot, { recursive: true })
+      fs.writeFileSync(
+        path.join(overlayRoot, 'runtime-audit.log'),
+        [
+          '{"ts":"2026-04-25T09:00:03.000Z","level":"info","scope":"supervisor","msg":"late audit"}',
+          '{"ts":"2026-04-25T09:00:01.000Z","level":"info","scope":"supervisor","msg":"early audit"}',
+        ].join('\n'),
+      )
+      const sv = new Supervisor(makeConfig({ workspaceRoot }))
+
+      try {
+        const bus = sv.initEventBus('run-dashboard-order')
+        bus.emit({
+          type: 'artifact.created',
+          runId: 'run-dashboard-order',
+          loop: 1,
+          agent: 'echo',
+          kind: 'md',
+          path: 'output/report.md',
+          timestamp: '2026-04-25T09:00:02.000Z',
+        })
+
+        const data = sv.getDashboardData()
+
+        expect(data.live.events.map(event => event.message)).toEqual([
+          'early audit',
+          'echo created md at output/report.md.',
+          'late audit',
+        ])
       } finally {
         fs.rmSync(overlayRoot, { recursive: true, force: true })
       }

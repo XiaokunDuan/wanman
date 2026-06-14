@@ -93,9 +93,13 @@ interface DashboardAuditEntry {
   agent: string | null;
   message: string;
   raw: string;
+  sortTimestampMs?: number;
+  sortOrder: number;
 }
 
 const ANSI_PATTERN = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+const DASHBOARD_AUDIT_TAIL_BYTES = 128 * 1024;
+const DASHBOARD_EVENT_HISTORY_LIMIT = 500;
 
 function stripAnsi(value: string): string {
   return value.replace(ANSI_PATTERN, '');
@@ -106,6 +110,48 @@ function isReadableAuditLine(line: string): boolean {
   if (!compact) return false;
   if (/^[\s─━=]+$/.test(compact)) return false;
   return true;
+}
+
+function tailTextFile(filePath: string, maxBytes: number): string {
+  const stat = fs.statSync(filePath);
+  if (stat.size <= maxBytes) {
+    return fs.readFileSync(filePath, 'utf-8');
+  }
+
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const start = Math.max(0, stat.size - maxBytes);
+    const buffer = Buffer.alloc(stat.size - start);
+    fs.readSync(fd, buffer, 0, buffer.length, start);
+
+    let raw = buffer.toString('utf-8');
+    if (start > 0) {
+      const firstNewline = raw.indexOf('\n');
+      raw = firstNewline >= 0 ? raw.slice(firstNewline + 1) : '';
+    }
+    return raw;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function capDashboardEvents(events: DashboardAuditEntry[]): DashboardAuditEntry[] {
+  if (events.length <= DASHBOARD_EVENT_HISTORY_LIMIT) return events;
+  return events.slice(events.length - DASHBOARD_EVENT_HISTORY_LIMIT);
+}
+
+function parseDashboardTimestampMs(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isNaN(timestamp) ? undefined : timestamp;
+}
+
+function compareDashboardEvents(a: DashboardAuditEntry, b: DashboardAuditEntry): number {
+  if (a.sortTimestampMs !== undefined && b.sortTimestampMs !== undefined && a.sortTimestampMs !== b.sortTimestampMs) {
+    return a.sortTimestampMs - b.sortTimestampMs;
+  }
+  if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+  return a.id.localeCompare(b.id);
 }
 
 function postStorySyncEvent(event: {
@@ -407,6 +453,7 @@ export class Supervisor {
     this.dashboardEventBusListener = (event: LoopEvent) => {
       const dashboardEvent = this.formatDashboardEvent(event)
       this.dashboardEvents.push(dashboardEvent)
+      this.dashboardEvents = capDashboardEvents(this.dashboardEvents)
       for (const subscriber of this.dashboardEventSubscribers) {
         try {
           subscriber(dashboardEvent)
@@ -431,9 +478,11 @@ export class Supervisor {
 
   private formatDashboardEvent(event: LoopEvent): DashboardAuditEntry {
     const timestamp = event.timestamp || new Date().toISOString()
+    const sortTimestampMs = parseDashboardTimestampMs(timestamp)
     const time = Number.isNaN(new Date(timestamp).getTime())
       ? timestamp
       : new Date(timestamp).toLocaleTimeString([], { hour12: false })
+    const sortOrder = ++this.dashboardEventSeq
     let agent: string | null = 'agent' in event && typeof event.agent === 'string' ? event.agent : null
     let message: string = event.type
 
@@ -469,13 +518,15 @@ export class Supervisor {
     }
 
     return {
-      id: `evt-${++this.dashboardEventSeq}`,
+      id: `evt-${sortOrder}`,
       time,
       source: 'event-bus',
       kind: event.type,
       agent,
       message,
       raw: JSON.stringify(event),
+      sortTimestampMs,
+      sortOrder,
     }
   }
 
@@ -2057,7 +2108,7 @@ ${activePaths}`;
     const artifacts = this.listDashboardArtifacts();
     const audit = this.readRuntimeAuditTrail();
     const live = this.readLiveDashboard();
-    const events = [...audit.entries, ...this.dashboardEvents];
+    const events = capDashboardEvents([...audit.entries, ...this.dashboardEvents].sort(compareDashboardEvents));
     const streamAvailable = this._eventBus !== null;
     const entryLabel = events.length === 1 ? 'entry' : 'entries';
     const note = streamAvailable
@@ -2165,7 +2216,7 @@ ${activePaths}`;
 
     for (const candidate of candidates) {
       if (!fs.existsSync(candidate.path)) continue;
-      const raw = fs.readFileSync(candidate.path, 'utf-8');
+      const raw = tailTextFile(candidate.path, DASHBOARD_AUDIT_TAIL_BYTES);
       const entries = raw
         .split(/\r?\n/)
         .map((line, index) => this.parseAuditLine(stripAnsi(line), candidate.source, index))
@@ -2198,6 +2249,8 @@ ${activePaths}`;
           agent,
           message: `${msg}${method}${text}`,
           raw: compact,
+          sortTimestampMs: parseDashboardTimestampMs(ts),
+          sortOrder: index,
         };
       } catch {
         // Fall through to the plain-line parsers; raw malformed JSON is still useful.
@@ -2218,6 +2271,7 @@ ${activePaths}`;
         agent,
         message: detail,
         raw: line.trim(),
+        sortOrder: index,
       };
     }
 
@@ -2229,6 +2283,7 @@ ${activePaths}`;
       agent: null,
       message: compact,
       raw: compact,
+      sortOrder: index,
     };
   }
 
