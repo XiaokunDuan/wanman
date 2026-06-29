@@ -7,6 +7,24 @@ export interface TaskInfo {
   result?: string
   initiativeId?: string
   capsuleId?: string
+  scope?: { paths?: string[]; patterns?: string[] }
+  subsystem?: string
+  scopeType?: 'code' | 'docs' | 'tests' | 'ops' | 'mixed'
+  executionProfile?: string
+}
+
+export interface RuntimeTaskCreateInput {
+  title: string
+  description?: string
+  assignee?: string
+  priority?: number
+  scope?: { paths: string[]; patterns?: string[] }
+  initiativeId?: string
+  capsuleId?: string
+  subsystem?: string
+  scopeType?: 'code' | 'docs' | 'tests' | 'ops' | 'mixed'
+  executionProfile?: string
+  agent?: string
 }
 
 export interface HealthAgent {
@@ -45,6 +63,23 @@ export interface RuntimeCapsule {
   taskId?: string
 }
 
+export interface RuntimeCapsuleCreateInput {
+  goal: string
+  ownerAgent: string
+  branch: string
+  baseCommit: string
+  allowedPaths: string[]
+  acceptance: string
+  reviewer?: string
+  initiativeId?: string
+  taskId?: string
+  subsystem?: string
+  scopeType?: 'code' | 'docs' | 'tests' | 'ops' | 'mixed'
+  blockedBy?: string[]
+  supersedes?: string
+  agent?: string
+}
+
 export interface RuntimeArtifact {
   agent: string
   kind: string
@@ -64,6 +99,8 @@ export interface RuntimeClient {
   listInitiatives(): Promise<RuntimeInitiative[]>
   listCapsules(): Promise<RuntimeCapsule[]>
   listArtifacts(): Promise<RuntimeArtifact[]>
+  createTask(input: RuntimeTaskCreateInput): Promise<TaskInfo>
+  createCapsule(input: RuntimeCapsuleCreateInput): Promise<RuntimeCapsule>
   createInitiative(input: {
     title: string
     goal: string
@@ -85,6 +122,11 @@ export interface RuntimeClient {
     id: string
     assignee?: string
     status?: string
+    initiativeId?: string
+    capsuleId?: string
+    subsystem?: string
+    scopeType?: 'code' | 'docs' | 'tests' | 'ops' | 'mixed'
+    executionProfile?: string
     agent?: string
   }): Promise<void>
 }
@@ -114,7 +156,7 @@ async function waitForHealthWith(getHealth: () => Promise<RuntimeHealth>, timeou
   throw new Error(`Supervisor not healthy within ${timeoutMs}ms`)
 }
 
-async function localRpc<T>(port: number, method: string, params: Record<string, unknown>): Promise<T> {
+async function localRpc<T>(port: number, method: string, params: object): Promise<T> {
   const response = await fetch(`http://127.0.0.1:${port}/rpc`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -153,6 +195,12 @@ export function createLocalRuntimeClient(port: number): RuntimeClient {
     listArtifacts: async () => {
       const result = await localRpc<{ artifacts: RuntimeArtifactRecord[] }>(port, 'artifact.list', {})
       return summarizeArtifacts(result.artifacts)
+    },
+    createTask: async input => {
+      return await localRpc<TaskInfo>(port, 'task.create', input)
+    },
+    createCapsule: async input => {
+      return await localRpc<RuntimeCapsule>(port, 'capsule.create', input)
     },
     createInitiative: async input => {
       await localRpc(port, 'initiative.create', input)

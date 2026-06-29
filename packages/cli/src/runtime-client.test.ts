@@ -70,6 +70,20 @@ describe('createLocalRuntimeClient', () => {
     fetchMock.mockResolvedValue(jsonResponse({ result: { ok: true } }));
 
     const client = createLocalRuntimeClient(3120);
+    await client.createTask({
+      title: 'Implement playable game',
+      assignee: 'dev',
+      scope: { paths: ['src'] },
+      priority: 1,
+    });
+    await client.createCapsule({
+      goal: 'Implement playable game',
+      ownerAgent: 'dev',
+      branch: 'wanman/implement-playable-game',
+      baseCommit: 'abc123',
+      allowedPaths: ['src'],
+      acceptance: 'pnpm test passes',
+    });
     await client.createInitiative({ title: 'Roadmap', goal: 'Ship', summary: 'Next', priority: 8, sources: ['README.md'] });
     await client.sendMessage({ from: 'ceo', to: 'dev', payload: 'Build it' });
     await client.spawnAgent('dev', 'dev-2');
@@ -77,12 +91,16 @@ describe('createLocalRuntimeClient', () => {
 
     const payloads = fetchMock.mock.calls.map(([, init]) => JSON.parse(String((init as RequestInit).body)));
     expect(payloads.map(payload => payload.method)).toEqual([
+      'task.create',
+      'capsule.create',
       'initiative.create',
       'agent.send',
       'agent.spawn',
       'task.update',
     ]);
-    expect(payloads[1]?.params).toEqual({ from: 'ceo', to: 'dev', payload: 'Build it' });
+    expect(payloads[0]?.params).toMatchObject({ title: 'Implement playable game', assignee: 'dev' });
+    expect(payloads[1]?.params).toMatchObject({ branch: 'wanman/implement-playable-game', ownerAgent: 'dev' });
+    expect(payloads[3]?.params).toEqual({ from: 'ceo', to: 'dev', payload: 'Build it' });
   });
 
   it('throws on RPC transport and application errors', async () => {

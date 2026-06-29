@@ -18,6 +18,8 @@ import {
   parseLocalGitStatus,
   planLocalDynamicClone,
   recoverOrphanLocalTasks,
+  repairLocalCapsuleGaps,
+  seedLocalFallbackBacklog,
 } from './takeover-local.js'
 import type { GeneratedAgentConfig, ProjectProfile } from './takeover-project.js'
 
@@ -181,6 +183,244 @@ describe('local takeover progress helpers', () => {
 
     expect(updateTask).not.toHaveBeenCalled()
     expect(sendMessage).not.toHaveBeenCalled()
+  })
+
+  it('seeds fallback backlog when CEO repeatedly leaves local takeover with no tasks', async () => {
+    const createTask = vi.fn().mockResolvedValue({ id: 'task-12345678', title: 'Implement playable RTS-lite command sandbox' })
+    const createCapsule = vi.fn().mockResolvedValue({ id: 'capsule-12345678', status: 'open' })
+    const updateTask = vi.fn().mockResolvedValue(undefined)
+    const sendMessage = vi.fn().mockResolvedValue(undefined)
+    const log = vi.fn()
+    const seedState = {}
+
+    await expect(seedLocalFallbackBacklog(
+      { createTask, createCapsule, updateTask, sendMessage },
+      makeState({
+        health: {
+          agents: [
+            { name: 'ceo', state: 'idle', lifecycle: '24/7' },
+            { name: 'dev', state: 'idle', lifecycle: 'on-demand' },
+          ],
+          runtime: { completedRunsByAgent: { ceo: 2 } },
+        },
+        initiatives: [{ id: 'initiative-1', title: 'Product', status: 'active', priority: 10 }],
+        headSha: 'abc123',
+      }),
+      {
+        projectName: 'RTS Stress',
+        summary: 'Game',
+        canonicalDocs: [
+          {
+            path: 'PROJECT_SPEC.md',
+            kind: 'roadmap',
+            title: 'Spec',
+            excerpt: '',
+            headings: [],
+            score: 95,
+          },
+        ],
+        roadmapDocs: [],
+        codeRoots: ['src'],
+        packageScripts: ['build', 'test'],
+        strategicThemes: [],
+        mission: 'Build game',
+      },
+      '/repo',
+      { seedState, log },
+    )).resolves.toBe(true)
+
+    expect(createTask).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'Implement playable RTS-lite command sandbox',
+      initiativeId: 'initiative-1',
+      scope: { paths: ['src', 'package.json', 'tsconfig.json', 'PROJECT_SPEC.md'] },
+    }))
+    expect(createTask.mock.calls[0]?.[0]).not.toHaveProperty('assignee')
+    expect(createCapsule).toHaveBeenCalledWith(expect.objectContaining({
+      ownerAgent: 'dev',
+      branch: 'wanman/rts-stress-playable-rts-lite',
+      baseCommit: 'abc123',
+      allowedPaths: ['src', 'package.json', 'tsconfig.json', 'PROJECT_SPEC.md'],
+      taskId: 'task-12345678',
+    }))
+    expect(updateTask).toHaveBeenCalledWith({
+      id: 'task-12345678',
+      status: 'assigned',
+      assignee: 'dev',
+      agent: 'takeover-fallback-backlog',
+    })
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      from: 'takeover-fallback-backlog',
+      to: 'dev',
+      priority: 'steer',
+    }))
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('fallback_backlog_seeded'))
+
+    await expect(seedLocalFallbackBacklog(
+      { createTask, createCapsule, updateTask, sendMessage },
+      makeState({
+        health: {
+          agents: [{ name: 'dev', state: 'idle', lifecycle: 'on-demand' }],
+          runtime: { completedRunsByAgent: { ceo: 2 } },
+        },
+        initiatives: [{ id: 'initiative-1', status: 'active', priority: 10 }],
+      }),
+      {
+        projectName: 'RTS Stress',
+        summary: 'Game',
+        canonicalDocs: [],
+        roadmapDocs: [],
+        codeRoots: ['src'],
+        packageScripts: [],
+        strategicThemes: [],
+        mission: 'Build game',
+      },
+      '/repo',
+      { seedState },
+    )).resolves.toBe(false)
+    expect(createTask).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not seed fallback backlog before CEO has had a chance or when backlog exists', async () => {
+    const createTask = vi.fn().mockResolvedValue({ id: 'task-1' })
+    const runtime = {
+      createTask,
+      createCapsule: vi.fn(),
+      updateTask: vi.fn(),
+      sendMessage: vi.fn(),
+    }
+    const intent = {
+      projectName: 'app',
+      summary: 'App',
+      canonicalDocs: [],
+      roadmapDocs: [],
+      codeRoots: ['src'],
+      packageScripts: [],
+      strategicThemes: [],
+      mission: 'Ship',
+    }
+
+    await expect(seedLocalFallbackBacklog(
+      runtime,
+      makeState({
+        health: {
+          agents: [{ name: 'dev', state: 'idle', lifecycle: 'on-demand' }],
+          runtime: { completedRunsByAgent: { ceo: 1 } },
+        },
+        initiatives: [{ id: 'initiative-1', status: 'active', priority: 10 }],
+      }),
+      intent,
+      '/repo',
+    )).resolves.toBe(false)
+    await expect(seedLocalFallbackBacklog(
+      runtime,
+      makeState({
+        health: {
+          agents: [{ name: 'dev', state: 'idle', lifecycle: 'on-demand' }],
+          runtime: { completedRunsByAgent: { ceo: 2 } },
+        },
+        initiatives: [{ id: 'initiative-1', status: 'active', priority: 10 }],
+        tasks: [{ id: 'existing', title: 'Task', status: 'assigned', assignee: 'dev', priority: 1 }],
+      }),
+      intent,
+      '/repo',
+    )).resolves.toBe(false)
+
+    expect(createTask).not.toHaveBeenCalled()
+  })
+
+  it('repairs active implementation tasks that are missing capsules', async () => {
+    const createCapsule = vi.fn().mockResolvedValue({ id: 'capsule-12345678', status: 'open' })
+    const updateTask = vi.fn().mockResolvedValue(undefined)
+    const sendMessage = vi.fn().mockResolvedValue(undefined)
+    const log = vi.fn()
+
+    await expect(repairLocalCapsuleGaps(
+      { createCapsule, updateTask, sendMessage },
+      makeState({
+        initiatives: [{ id: 'initiative-1', status: 'active', priority: 10 }],
+        headSha: 'abc123',
+        tasks: [{
+          id: 'task-12345678',
+          title: 'Replace starter shell with neutral RTS-lite launch metadata',
+          status: 'in_progress',
+          assignee: 'dev',
+          priority: 2,
+          initiativeId: 'initiative-1',
+          scope: { paths: ['index.html', 'public'] },
+        }],
+      }),
+      {
+        projectName: 'RTS Stress',
+        summary: 'Game',
+        canonicalDocs: [{ path: 'PROJECT_SPEC.md', kind: 'roadmap', title: 'Spec', excerpt: '', headings: [], score: 95 }],
+        roadmapDocs: [],
+        codeRoots: ['src'],
+        packageScripts: ['build', 'test'],
+        strategicThemes: [],
+        mission: 'Build game',
+      },
+      '/repo',
+      { log },
+    )).resolves.toBe(true)
+
+    expect(createCapsule).toHaveBeenCalledWith(expect.objectContaining({
+      goal: 'Replace starter shell with neutral RTS-lite launch metadata',
+      ownerAgent: 'dev',
+      branch: 'wanman/replace-starter-shell-with-neutral-rts-lite-launch-metadata',
+      baseCommit: 'abc123',
+      allowedPaths: ['index.html', 'public', 'src', 'package.json', 'tsconfig.json', 'PROJECT_SPEC.md'],
+      initiativeId: 'initiative-1',
+      taskId: 'task-12345678',
+    }))
+    expect(updateTask).toHaveBeenCalledWith({
+      id: 'task-12345678',
+      initiativeId: 'initiative-1',
+      capsuleId: 'capsule-12345678',
+      subsystem: 'takeover-task',
+      scopeType: 'mixed',
+      executionProfile: 'implementation',
+      agent: 'takeover-capsule-repair',
+    })
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      from: 'takeover-capsule-repair',
+      to: 'dev',
+      priority: 'steer',
+    }))
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('capsule_gap_repaired'))
+  })
+
+  it('does not repair capsule gaps for non-dev or completed tasks', async () => {
+    const createCapsule = vi.fn().mockResolvedValue({ id: 'capsule-1' })
+    const runtime = {
+      createCapsule,
+      updateTask: vi.fn(),
+      sendMessage: vi.fn(),
+    }
+    const intent = {
+      projectName: 'app',
+      summary: 'App',
+      canonicalDocs: [],
+      roadmapDocs: [],
+      codeRoots: ['src'],
+      packageScripts: [],
+      strategicThemes: [],
+      mission: 'Ship',
+    }
+
+    await expect(repairLocalCapsuleGaps(
+      runtime,
+      makeState({
+        initiatives: [{ id: 'initiative-1', status: 'active', priority: 10 }],
+        tasks: [
+          { id: 'done', title: 'Implement done', status: 'done', assignee: 'dev', priority: 1 },
+          { id: 'docs', title: 'Write notes', status: 'in_progress', assignee: 'feedback', priority: 3 },
+        ],
+      }),
+      intent,
+      '/repo',
+    )).resolves.toBe(false)
+
+    expect(createCapsule).not.toHaveBeenCalled()
   })
 
   it('gates repeated runtime errors with bounded retries and fail-fast', () => {

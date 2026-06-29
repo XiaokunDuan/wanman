@@ -34,6 +34,7 @@ import { formatDashboard, renderDashboard, type DashboardState } from './tui/das
 const MAX_DEV_WORKERS = 3
 const SUCCESSFUL_CHECK_CONCLUSIONS = new Set(['success', 'skipped', 'neutral'])
 const MAX_RUNTIME_ERROR_RETRIES = 2
+const FALLBACK_BACKLOG_COMPLETED_CEO_RUNS = 2
 
 type CheckState = 'success' | 'failure' | 'pending' | 'none' | 'unknown'
 
@@ -101,6 +102,10 @@ export interface RuntimeErrorGateResult {
 }
 
 type LocalMissionNudgeState = MissionNudgeState
+
+interface LocalFallbackBacklogState {
+  seeded?: boolean
+}
 
 /** @internal exported for testing */
 export function warnLocalEnvironment(profile: ProjectProfile, worktreePath: string): void {
@@ -512,6 +517,14 @@ export function hasLocalProgress(previous: LocalObservationState, current: Local
   return snapshotWorktree(previous) !== snapshotWorktree(current)
 }
 
+function slugifyBranchPart(value: string): string {
+  const slug = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return slug || 'project'
+}
+
 function createLoggedLocalCoordinationBackend(runtime: RuntimeClient) {
   return createTakeoverCoordinationBackend(runtime, {
     log: message => {
@@ -524,6 +537,31 @@ function isImplementationTask(task: TaskInfo): boolean {
   const title = task.title.toLowerCase()
   return task.capsuleId !== undefined
     || /(implement|build|fix|add|update|refactor|test|game|ui|feature)/.test(title)
+}
+
+function isDevWorker(assignee?: string): boolean {
+  return assignee === 'dev' || /^dev-\d+$/.test(assignee ?? '')
+}
+
+function buildDefaultTakeoverPaths(intent: ProjectIntent): string[] {
+  return [
+    ...new Set([
+      ...intent.codeRoots,
+      'package.json',
+      'tsconfig.json',
+      ...intent.canonicalDocs
+        .map(doc => doc.path)
+        .filter(docPath => /spec|roadmap|plan|requirements|prd/i.test(docPath)),
+    ].filter(Boolean)),
+  ]
+}
+
+function extractTaskPaths(task: TaskInfo, intent: ProjectIntent): string[] {
+  const paths = [
+    ...(task.scope?.paths ?? []),
+    ...buildDefaultTakeoverPaths(intent),
+  ]
+  return [...new Set(paths.filter(Boolean))]
 }
 
 /** @internal exported for testing */
@@ -565,6 +603,167 @@ export async function recoverOrphanLocalTasks(
   }
 
   return true
+}
+
+/** @internal exported for testing */
+export async function seedLocalFallbackBacklog(
+  runtime: Pick<RuntimeClient, 'createTask' | 'createCapsule' | 'updateTask' | 'sendMessage'>,
+  state: LocalObservationState,
+  intent: ProjectIntent,
+  worktreePath: string,
+  opts: { seedState?: LocalFallbackBacklogState; log?: (message: string) => void } = {},
+): Promise<boolean> {
+  const seedState = opts.seedState ?? {}
+  if (seedState.seeded) return false
+  if (state.tasks.length > 0 || state.capsules.length > 0) return false
+  const completedCeoRuns = state.health.runtime?.completedRunsByAgent?.['ceo'] ?? 0
+  if (completedCeoRuns < FALLBACK_BACKLOG_COMPLETED_CEO_RUNS) return false
+
+  const devAvailable = state.health.agents.some(agent => agent.name === 'dev')
+  if (!devAvailable) return false
+  const initiative = state.initiatives
+    .filter(item => item.status === 'active')
+    .sort((left, right) => (right.priority ?? 0) - (left.priority ?? 0))[0]
+  if (!initiative) return false
+
+  const paths = buildDefaultTakeoverPaths(intent)
+  const scopedPaths = paths.length > 0 ? paths : ['.']
+  const baseCommit = state.headSha ?? readGitRef(worktreePath, 'HEAD') ?? 'HEAD'
+  const branch = `wanman/${slugifyBranchPart(intent.projectName)}-playable-rts-lite`
+  const title = `Implement playable RTS-lite command sandbox`
+  const acceptance = [
+    'Default page opens into the playable RTS-lite experience described in PROJECT_SPEC.md or the canonical project spec.',
+    'Simulation/domain logic is separated enough for focused tests.',
+    'Run pnpm install if needed, then pnpm build and pnpm test successfully before marking done.',
+    'Do not commit .wanman artifacts.',
+  ].join(' ')
+
+  const task = await runtime.createTask({
+    title,
+    description: [
+      `CEO produced no executable backlog after ${completedCeoRuns} completed run(s), so local takeover seeded this fallback task from the canonical project spec.`,
+      `Implement the finite playable browser game for ${intent.projectName}: selection, movement, resources, production, combat, enemy pressure, win/loss, save/load, and verification tests.`,
+    ].join(' '),
+    priority: 1,
+    scope: { paths: scopedPaths },
+    initiativeId: initiative.id,
+    subsystem: 'rts-lite-game',
+    scopeType: 'mixed',
+    executionProfile: 'implementation',
+    agent: 'takeover-fallback-backlog',
+  })
+  const capsule = await runtime.createCapsule({
+    goal: title,
+    ownerAgent: 'dev',
+    branch,
+    baseCommit,
+    allowedPaths: scopedPaths,
+    acceptance,
+    reviewer: 'cto',
+    initiativeId: initiative.id,
+    taskId: task.id,
+    subsystem: 'rts-lite-game',
+    scopeType: 'mixed',
+    agent: 'takeover-fallback-backlog',
+  })
+  await runtime.updateTask({
+    id: task.id,
+    status: 'assigned',
+    assignee: 'dev',
+    agent: 'takeover-fallback-backlog',
+  })
+  await runtime.sendMessage({
+    from: 'takeover-fallback-backlog',
+    to: 'dev',
+    type: 'message',
+    priority: 'steer',
+    payload: [
+      `Fallback backlog seeded task ${task.id.slice(0, 8)} and capsule ${capsule.id.slice(0, 8)} because CEO left the backlog empty.`,
+      `Work on branch ${branch}, stay within allowed paths: ${scopedPaths.join(', ')}.`,
+      acceptance,
+    ].join(' '),
+  })
+
+  seedState.seeded = true
+  opts.log?.(`fallback_backlog_seeded task=${task.id.slice(0, 8)} capsule=${capsule.id.slice(0, 8)} assignee=dev`)
+  return true
+}
+
+/** @internal exported for testing */
+export async function repairLocalCapsuleGaps(
+  runtime: Pick<RuntimeClient, 'createCapsule' | 'updateTask' | 'sendMessage'>,
+  state: LocalObservationState,
+  intent: ProjectIntent,
+  worktreePath: string,
+  opts: { log?: (message: string) => void } = {},
+): Promise<boolean> {
+  const activeInitiative = state.initiatives
+    .filter(item => item.status === 'active')
+    .sort((left, right) => (right.priority ?? 0) - (left.priority ?? 0))[0]
+  if (!activeInitiative) return false
+
+  const changedTasks = state.tasks.filter(task => (
+    task.status !== 'done'
+    && isDevWorker(task.assignee)
+    && (!task.initiativeId || !task.capsuleId)
+    && task.scopeType !== 'docs'
+    && task.scopeType !== 'ops'
+  ))
+  if (changedTasks.length === 0) return false
+
+  const baseCommit = state.headSha ?? readGitRef(worktreePath, 'HEAD') ?? 'HEAD'
+  let changed = false
+  for (const task of changedTasks) {
+    const initiativeId = task.initiativeId ?? activeInitiative.id
+    const ownerAgent = task.assignee ?? 'dev'
+    const scopedPaths = extractTaskPaths(task, intent)
+    const allowedPaths = scopedPaths.length > 0 ? scopedPaths : ['.']
+    const branch = `wanman/${slugifyBranchPart(task.title)}`
+    const acceptance = [
+      `Complete task ${task.id.slice(0, 8)}: ${task.title}.`,
+      'Stay within allowed paths.',
+      'Run the closest available verification commands before marking done.',
+      'Do not commit .wanman artifacts.',
+    ].join(' ')
+    const capsule = await runtime.createCapsule({
+      goal: task.title,
+      ownerAgent,
+      branch,
+      baseCommit,
+      allowedPaths,
+      acceptance,
+      reviewer: 'cto',
+      initiativeId,
+      taskId: task.id,
+      subsystem: task.subsystem ?? 'takeover-task',
+      scopeType: task.scopeType ?? 'mixed',
+      agent: 'takeover-capsule-repair',
+    })
+    await runtime.updateTask({
+      id: task.id,
+      initiativeId,
+      capsuleId: capsule.id,
+      subsystem: task.subsystem ?? 'takeover-task',
+      scopeType: task.scopeType ?? 'mixed',
+      executionProfile: task.executionProfile ?? 'implementation',
+      agent: 'takeover-capsule-repair',
+    })
+    await runtime.sendMessage({
+      from: 'takeover-capsule-repair',
+      to: ownerAgent,
+      type: 'message',
+      priority: 'steer',
+      payload: [
+        `Created and linked missing capsule ${capsule.id.slice(0, 8)} for task ${task.id.slice(0, 8)}.`,
+        `Use branch ${branch} and stay within allowed paths: ${allowedPaths.join(', ')}.`,
+        acceptance,
+      ].join(' '),
+    }).catch(() => undefined)
+    opts.log?.(`capsule_gap_repaired task=${task.id.slice(0, 8)} capsule=${capsule.id.slice(0, 8)} assignee=${ownerAgent}`)
+    changed = true
+  }
+
+  return changed
 }
 
 export function planLocalDynamicClone(state: LocalObservationState) {
@@ -901,6 +1100,7 @@ export async function runLocal(
       let lastProgressAt = Date.now()
       const prNudgeState: LocalPrNudgeState = {}
       const missionNudgeState: LocalMissionNudgeState = {}
+      const fallbackBacklogState: LocalFallbackBacklogState = {}
       const runtimeErrorGate = createRuntimeErrorGateState()
       let lastPrintedSnapshot = ''
       let childExitCode: number | null = null
@@ -952,6 +1152,15 @@ export async function runLocal(
         }
         const nudgedMission = await maybeNudgeLocalMissionControl(runtime, current, generated.intent, missionNudgeState).catch(() => false)
         if (nudgedMission) current = await collectLocalObservationState(runtime, worktreePath, localLogs)
+        const repairedCapsules = await repairLocalCapsuleGaps(runtime, current, generated.intent, worktreePath, {
+          log: message => console.log(`  [local] ${message}`),
+        }).catch(() => false)
+        if (repairedCapsules) current = await collectLocalObservationState(runtime, worktreePath, localLogs)
+        const seededFallbackBacklog = await seedLocalFallbackBacklog(runtime, current, generated.intent, worktreePath, {
+          seedState: fallbackBacklogState,
+          log: message => console.log(`  [local] ${message}`),
+        }).catch(() => false)
+        if (seededFallbackBacklog) current = await collectLocalObservationState(runtime, worktreePath, localLogs)
         const recoveredOrphans = await recoverOrphanLocalTasks(runtime, current, {
           log: message => console.log(`  [local] ${message}`),
         }).catch(() => false)

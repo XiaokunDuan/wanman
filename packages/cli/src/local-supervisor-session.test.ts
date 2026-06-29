@@ -23,6 +23,8 @@ function makeSupervisor(overrides: Partial<LocalSupervisorHandle> = {}): LocalSu
       listInitiatives: vi.fn(),
       listCapsules: vi.fn(),
       listArtifacts: vi.fn(),
+      createTask: vi.fn(),
+      createCapsule: vi.fn(),
       createInitiative: vi.fn(),
       sendMessage: vi.fn(),
       spawnAgent: vi.fn(),
