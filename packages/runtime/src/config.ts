@@ -89,6 +89,7 @@ export function ensureWorkspaceDirs(config: AgentMatrixConfig): void {
       fs.mkdirSync(dir, { recursive: true });
       log.info('created workspace', { agent: agent.name, dir });
     }
+    fs.mkdirSync(path.join(dir, 'output'), { recursive: true });
 
     // Copy AGENT.md skill file into the agent workspace if available
     const skillSrc = path.join(skillsDir, agent.name, 'AGENT.md');
@@ -126,6 +127,7 @@ export function buildEnrichedPrompt(
   workspaceRoot: string,
   allAgents?: AgentDefinition[],
   goal?: string,
+  executionCwd?: string,
 ): string {
   const agentDir = `${workspaceRoot}/${agent.name}`;
 
@@ -146,7 +148,8 @@ ${protocol}
 ## Your File Locations
 
 - Role guide: \`${agentDir}/AGENT.md\` ← **read this file first**
-- Working directory: \`${agentDir}/\` (all outputs go in \`${agentDir}/output/\`)
+- Current shell directory: \`${executionCwd ?? agentDir}\`
+- Agent workspace: \`${agentDir}/\` (all outputs go in \`${agentDir}/output/\`)
 - Shared skills are mounted at runtime via the **Active Skill Snapshot** section in your task prompt
 - Do not assume every shared skill is active; only read the files explicitly listed in that snapshot
 

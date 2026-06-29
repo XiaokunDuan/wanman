@@ -157,6 +157,11 @@ function postStorySyncArtifact(artifact: {
   }).catch(() => {});
 }
 
+function shouldRunAgentInGitRoot(def: AgentMatrixConfig['agents'][number]): boolean {
+  if (def.name === 'ceo') return false;
+  return /dev|engineer|implement|code|ops|test|review|cto/i.test(def.name);
+}
+
 export interface SupervisorOptions {
   credentialManager?: CredentialManager;
   /** If true, skip starting agent processes and cron jobs (HTTP + stores only). */
@@ -576,6 +581,9 @@ ${activePaths}`;
 
     const workspaceRoot = this.config.workspaceRoot || '/workspace/agents'
     const workDir = `${workspaceRoot}/${name}`
+    const gitRoot = this.config.gitRoot || process.env['WANMAN_GIT_ROOT']
+      || workspaceRoot.replace(/\/agents\/?$/, '') || workDir
+    const executionCwd = shouldRunAgentInGitRoot(cloneDef) ? gitRoot : workDir
     const templateWorkDir = `${workspaceRoot}/${templateName}`
     fs.mkdirSync(workDir, { recursive: true })
     for (const entry of ['AGENT.md', 'CLAUDE.md']) {
@@ -598,7 +606,7 @@ ${activePaths}`;
     const timeBudgetMs = parseInt(process.env['WANMAN_TIME_BUDGET_MS'] || '0', 10) || undefined
 
     const agentProc = new AgentProcess(
-      cloneDef, this.relay, workDir,
+      cloneDef, this.relay, executionCwd,
       this.credentialManager, agentEnv, goal,
       preambleProvider, onRunComplete, timeBudgetMs,
       (agentName) => this.hasAutonomousWork(agentName),
@@ -786,11 +794,12 @@ ${activePaths}`;
       if (def.apiKey) agentEnv['ANTHROPIC_AUTH_TOKEN'] = def.apiKey;
       // We enrich prompts whenever the agent is not relying on the default Claude Code
       // workflow alone. Codex needs the same explicit protocol guidance as external LLMs.
+      const executionCwd = shouldRunAgentInGitRoot(def) ? gitRoot : workDir;
       const shouldEnrichPrompt = runtime === 'codex'
         || !!def.baseUrl
         || !!process.env['ANTHROPIC_BASE_URL'];
       const agentDef = shouldEnrichPrompt
-        ? { ...def, systemPrompt: buildEnrichedPrompt(def, workspaceRoot, this.config.agents, goal) }
+        ? { ...def, systemPrompt: buildEnrichedPrompt(def, workspaceRoot, this.config.agents, goal, executionCwd) }
         : def;
       // Preamble provider: generates context summary on agent respawn
       const preambleProvider = this.buildPreambleProvider();
@@ -802,7 +811,7 @@ ${activePaths}`;
       const agentProc = new AgentProcess(
         agentDef,
         this.relay,
-        workDir,
+        executionCwd,
         this.credentialManager,
         agentEnv,
         goal,

@@ -285,4 +285,17 @@ describe('buildEnrichedPrompt', () => {
     expect(prompt).toContain('Active Skill Snapshot')
     expect(prompt).toContain('Do not assume every shared skill is active')
   });
+
+  it('separates the execution cwd from the agent output workspace', () => {
+    const prompt = buildEnrichedPrompt(
+      { name: 'dev', lifecycle: '24/7' as const, model: 'sonnet', systemPrompt: 'You are dev' },
+      '/tmp/workspace',
+      sampleConfig.agents,
+      'Ship the patch',
+      '/tmp/repo',
+    );
+
+    expect(prompt).toContain('Current shell directory: `/tmp/repo`')
+    expect(prompt).toContain('Agent workspace: `/tmp/workspace/dev/`')
+  });
 });

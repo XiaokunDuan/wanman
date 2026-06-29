@@ -36,12 +36,21 @@ vi.mock('../logger.js', () => ({
   }),
 }))
 
+const { createdAgentProcesses } = vi.hoisted(() => ({
+  createdAgentProcesses: [] as Array<{ def: unknown; workDir: string }>,
+}))
+
 // Mock agent-process
 vi.mock('../agent-process.js', () => {
   class MockAgentProcess {
     definition: unknown
+    workDir: string
     state = 'idle'
-    constructor(def: unknown) { this.definition = def }
+    constructor(def: unknown, _relay: unknown, workDir: string) {
+      this.definition = def
+      this.workDir = workDir
+      createdAgentProcesses.push({ def, workDir })
+    }
     async start() {}
     stop() {}
     handleSteer() {}
@@ -70,6 +79,7 @@ function cmds(): string[] {
 describe('Supervisor initWorkspaceGit', () => {
   afterEach(async () => {
     vi.clearAllMocks()
+    createdAgentProcesses.length = 0
   })
 
   it('should skip init when already a git repo', async () => {
@@ -146,6 +156,29 @@ describe('Supervisor initWorkspaceGit', () => {
 
     const call = mockExecSync.mock.calls.find(c => c[0] === 'git rev-parse --is-inside-work-tree')
     expect(call![1]).toEqual(expect.objectContaining({ cwd: '/workspace/project/repo' }))
+
+    await supervisor.shutdown()
+  })
+
+  it('starts implementation agents in gitRoot instead of the agent workspace', async () => {
+    mockExecSync.mockReturnValue('')
+
+    const supervisor = new Supervisor(makeConfig({
+      agents: [
+        { name: 'ceo', lifecycle: '24/7', model: 'sonnet', systemPrompt: 'ceo' },
+        { name: 'dev', lifecycle: 'on-demand', model: 'sonnet', systemPrompt: 'dev' },
+      ],
+      workspaceRoot: '/workspace/project/repo/.wanman/agents',
+      gitRoot: '/workspace/project/repo',
+    }))
+    await supervisor.start()
+
+    expect(createdAgentProcesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ workDir: '/workspace/project/repo/.wanman/agents/ceo' }),
+        expect.objectContaining({ workDir: '/workspace/project/repo' }),
+      ]),
+    )
 
     await supervisor.shutdown()
   })

@@ -595,7 +595,8 @@ function buildTakeoverSystemPrompt(
     base.systemPrompt.replace(/CLAUDE\.md/g, 'AGENT.md'),
     paths.cliCommand,
   )
-  return `${basePrompt}\n\nCurrent takeover project: ${intent.projectName}.\nLong-running mission: ${intent.mission}\nRead ${paths.sharedSkillPath} and AGENT.md in your working directory before starting work.`
+  const agentGuidePath = `${paths.projectRoot}/../agents/${base.name}/AGENT.md`
+  return `${basePrompt}\n\nCurrent takeover project: ${intent.projectName}.\nLong-running mission: ${intent.mission}\nRead ${paths.sharedSkillPath} and ${agentGuidePath} before starting work.`
 }
 
 function toProjectPath(relativePath: string, projectRoot: string): string {
