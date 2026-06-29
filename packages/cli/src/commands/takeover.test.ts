@@ -562,6 +562,30 @@ describe('project intent', () => {
     expect(intent.packageScripts).toContain('build')
     expect(intent.codeRoots).toContain('src')
   })
+
+  it('should treat root project specs as canonical roadmap signals', () => {
+    touch('PROJECT_SPEC.md', '# RTS-lite Command Sandbox Spec\n\n## Required Gameplay\n- grid map\n- resource gathering\n')
+    touch('package.json', JSON.stringify({
+      name: 'spec-only-app',
+      scripts: { build: 'vite build' },
+    }))
+    mkdirSync(join(tmpDir, 'src'), { recursive: true })
+
+    const profile = scanProject(tmpDir)
+    const docs = collectProjectDocs(tmpDir)
+    const intent = buildProjectIntent(profile)
+
+    expect(profile.hasReadme).toBe(false)
+    expect(profile.hasDocs).toBe(false)
+    expect(docs[0]).toMatchObject({
+      path: 'PROJECT_SPEC.md',
+      kind: 'roadmap',
+      title: 'RTS-lite Command Sandbox Spec',
+    })
+    expect(intent.canonicalDocs.map(doc => doc.path)).toContain('PROJECT_SPEC.md')
+    expect(intent.roadmapDocs.map(doc => doc.path)).toContain('PROJECT_SPEC.md')
+    expect(intent.strategicThemes.some(theme => theme.includes('roadmap'))).toBe(true)
+  })
 })
 
 describe('materializeTakeoverProject', () => {

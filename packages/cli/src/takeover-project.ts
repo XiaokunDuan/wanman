@@ -302,7 +302,7 @@ function titleFromContent(filePath: string, content: string): string {
 function scoreDocument(relativePath: string): { score: number; kind: ProjectDocument['kind'] } {
   const normalized = relativePath.replace(/\\/g, '/').toLowerCase()
   if (/^readme(\.|$)/.test(normalized)) return { score: 100, kind: 'readme' }
-  if (/(^|\/)(roadmap|todo|backlog|milestone|plan|vision|prd|strategy)/.test(normalized)) return { score: 95, kind: 'roadmap' }
+  if (/(^|\/)(project[-_ ]?)?spec(ification)?(\.|$)|(^|\/)(requirements|roadmap|todo|backlog|milestone|plan|vision|prd|strategy)(\.|\/|$)/.test(normalized)) return { score: 95, kind: 'roadmap' }
   if (/^claude\.md$/.test(normalized)) return { score: 85, kind: 'notes' }
   if (/^package\.json$|^pyproject\.toml$|^cargo\.toml$|^go\.mod$/.test(normalized)) return { score: 70, kind: 'manifest' }
   if (/^docs\/.+\.(md|mdx|rst|txt)$/.test(normalized)) return { score: 60, kind: 'docs' }
@@ -336,6 +336,12 @@ export function collectProjectDocs(projectPath: string): ProjectDocument[] {
     'CLAUDE.md',
     'ROADMAP.md',
     'ROADMAP',
+    'PROJECT_SPEC.md',
+    'PROJECT-SPEC.md',
+    'SPEC.md',
+    'SPECIFICATION.md',
+    'REQUIREMENTS.md',
+    'PRD.md',
     'TODO.md',
     'TODO',
     'CHANGELOG.md',
