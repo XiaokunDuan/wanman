@@ -1,6 +1,6 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import { execSync } from 'node:child_process'
+import { execFileSync, execSync } from 'node:child_process'
 import logUpdate from 'log-update'
 import type { RunOptions } from './execution-session.js'
 import { runLocalSupervisorSession } from './local-supervisor-session.js'
@@ -401,6 +401,61 @@ function readGitRef(worktreePath: string, ref: string): string | undefined {
   }
 }
 
+function readCurrentBranch(worktreePath: string): string | undefined {
+  try {
+    return execSync('git branch --show-current', {
+      cwd: worktreePath,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() || undefined
+  } catch {
+    return undefined
+  }
+}
+
+function isCleanWorktree(worktreePath: string): boolean {
+  try {
+    return execSync('git status --porcelain', {
+      cwd: worktreePath,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() === ''
+  } catch {
+    return false
+  }
+}
+
+/** @internal exported for testing */
+export function ensureLocalCapsuleBranch(
+  worktreePath: string,
+  branch: string,
+  opts: { log?: (message: string) => void } = {},
+): boolean {
+  if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes('..') || branch.startsWith('-')) {
+    opts.log?.(`capsule_branch_checkout_skipped branch=${branch} reason=invalid`)
+    return false
+  }
+  if (readCurrentBranch(worktreePath) === branch) return false
+  if (!isCleanWorktree(worktreePath)) {
+    opts.log?.(`capsule_branch_checkout_skipped branch=${branch} reason=dirty_worktree`)
+    return false
+  }
+
+  try {
+    if (readGitRef(worktreePath, `refs/heads/${branch}`)) {
+      execFileSync('git', ['checkout', branch], { cwd: worktreePath, stdio: 'ignore' })
+    } else {
+      execFileSync('git', ['checkout', '-b', branch], { cwd: worktreePath, stdio: 'ignore' })
+    }
+  } catch (err) {
+    opts.log?.(`capsule_branch_checkout_failed branch=${branch} reason=${err instanceof Error ? err.message : String(err)}`)
+    return false
+  }
+
+  opts.log?.(`capsule_branch_checked_out branch=${branch}`)
+  return true
+}
+
 function readGitDivergence(worktreePath: string, leftRef: string, rightRef: string): { leftOnly: number; rightOnly: number } {
   try {
     const raw = execSync(`git rev-list --left-right --count ${JSON.stringify(leftRef)}...${JSON.stringify(rightRef)}`, {
@@ -666,6 +721,7 @@ export async function seedLocalFallbackBacklog(
     scopeType: 'mixed',
     agent: 'takeover-fallback-backlog',
   })
+  ensureLocalCapsuleBranch(worktreePath, branch, opts)
   await runtime.updateTask({
     id: task.id,
     status: 'assigned',
@@ -739,6 +795,7 @@ export async function repairLocalCapsuleGaps(
       scopeType: task.scopeType ?? 'mixed',
       agent: 'takeover-capsule-repair',
     })
+    ensureLocalCapsuleBranch(worktreePath, branch, opts)
     await runtime.updateTask({
       id: task.id,
       initiativeId,

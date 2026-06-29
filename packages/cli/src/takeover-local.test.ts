@@ -10,6 +10,7 @@ import {
   buildPrNudgeSignature,
   collectPrNudgeRecipients,
   createRuntimeErrorGateState,
+  ensureLocalCapsuleBranch,
   evaluateRuntimeErrorGate,
   getLocalCompletionReason,
   hasLocalProgress,
@@ -832,6 +833,52 @@ describe('materializeLocalTakeoverProject', () => {
     expect(agentsConfig.gitRoot).toBe(path.join(wanmanDir, 'worktree'))
     expect(agentsConfig.agents[0]?.model).toBe('high')
     expect(fs.readFileSync(path.join(wanmanDir, 'skills', 'takeover-context', 'SKILL.md'), 'utf-8')).toContain('Ship project')
+  })
+})
+
+describe('ensureLocalCapsuleBranch', () => {
+  it('checks out a clean worktree onto the requested capsule branch', () => {
+    const repo = fs.mkdtempSync(path.join(tmpdir(), 'wanman-capsule-branch-'))
+    try {
+      execGit(repo, 'init')
+      execGit(repo, 'config user.email test@example.com')
+      execGit(repo, 'config user.name Test')
+      fs.writeFileSync(path.join(repo, 'README.md'), '# App\n')
+      execGit(repo, 'add README.md')
+      execGit(repo, 'commit -m init')
+
+      const logs: string[] = []
+      const changed = ensureLocalCapsuleBranch(repo, 'wanman/playable-rts-lite', { log: message => logs.push(message) })
+
+      expect(changed).toBe(true)
+      expect(execSync('git branch --show-current', { cwd: repo, encoding: 'utf-8' }).trim()).toBe('wanman/playable-rts-lite')
+      expect(logs).toContain('capsule_branch_checked_out branch=wanman/playable-rts-lite')
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('does not switch branches when local changes are present', () => {
+    const repo = fs.mkdtempSync(path.join(tmpdir(), 'wanman-capsule-branch-'))
+    try {
+      execGit(repo, 'init')
+      execGit(repo, 'config user.email test@example.com')
+      execGit(repo, 'config user.name Test')
+      fs.writeFileSync(path.join(repo, 'README.md'), '# App\n')
+      execGit(repo, 'add README.md')
+      execGit(repo, 'commit -m init')
+      const initialBranch = execSync('git branch --show-current', { cwd: repo, encoding: 'utf-8' }).trim()
+      fs.writeFileSync(path.join(repo, 'README.md'), '# Dirty\n')
+
+      const logs: string[] = []
+      const changed = ensureLocalCapsuleBranch(repo, 'wanman/playable-rts-lite', { log: message => logs.push(message) })
+
+      expect(changed).toBe(false)
+      expect(execSync('git branch --show-current', { cwd: repo, encoding: 'utf-8' }).trim()).toBe(initialBranch)
+      expect(logs).toContain('capsule_branch_checkout_skipped branch=wanman/playable-rts-lite reason=dirty_worktree')
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true })
+    }
   })
 })
 
