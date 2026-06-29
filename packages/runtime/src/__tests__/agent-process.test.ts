@@ -100,12 +100,17 @@ vi.mock('../codex-adapter.js', () => ({
   }),
 }))
 
+const { mockLogInfo, mockLogWarn } = vi.hoisted(() => ({
+  mockLogInfo: vi.fn(),
+  mockLogWarn: vi.fn(),
+}))
+
 // Mock logger
 vi.mock('../logger.js', () => ({
   createLogger: () => ({
     debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
+    info: mockLogInfo,
+    warn: mockLogWarn,
     error: vi.fn(),
   }),
 }))
@@ -131,6 +136,8 @@ describe('AgentProcess', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    mockLogInfo.mockClear()
+    mockLogWarn.mockClear()
     codexStartRunMock.mockClear()
     waitDeferreds = []
     eventHandlers = []
@@ -645,6 +652,14 @@ describe('AgentProcess', () => {
       await new Promise(r => setTimeout(r, 0))
 
       eventHandlers[0]?.({ type: 'item.completed', item: { title: 'done' } })
+      eventHandlers[0]?.({
+        type: 'item.completed',
+        item: {
+          type: 'tool_call',
+          name: 'exec_command',
+          arguments: { cmd: 'pnpm test -- --run' },
+        },
+      })
       eventHandlers[0]?.({ type: 'turn.failed', error: { message: 'bad turn' } })
       eventHandlers[0]?.({ type: 'event', tool_name: 'Bash', tool_input: { command: 'pnpm test' } })
       eventHandlers[0]?.({ type: 'event', tool_name: 'Read', tool_input: { file_path: 'README.md' } })
@@ -669,6 +684,11 @@ describe('AgentProcess', () => {
       waitDeferreds[0].resolve(0)
       await triggerPromise
       expect(agent.state).toBe('idle')
+      expect(mockLogInfo).toHaveBeenCalledWith('tool', expect.objectContaining({
+        agent: 'test-agent',
+        tool: 'exec_command',
+        summary: 'pnpm test -- --run',
+      }))
     })
   })
 

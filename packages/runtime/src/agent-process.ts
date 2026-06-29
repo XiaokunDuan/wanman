@@ -57,6 +57,71 @@ interface TokenUsageSnapshot {
   totalTokens: number
 }
 
+interface EventToolSummary {
+  tool: string
+  summary?: unknown
+}
+
+function pickShortString(value: unknown, maxLength = 200): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed ? trimmed.slice(0, maxLength) : undefined
+}
+
+function summarizeToolInput(tool: string | undefined, input: unknown): unknown {
+  if (!input || typeof input !== 'object') return pickShortString(input)
+  const record = input as Record<string, unknown>
+  if (tool === 'Bash' || tool === 'Shell' || tool === 'exec_command') {
+    return pickShortString(record.command) ?? pickShortString(record.cmd) ?? JSON.stringify(input).slice(0, 200)
+  }
+  return pickShortString(record.file_path)
+    ?? pickShortString(record.path)
+    ?? pickShortString(record.cmd)
+    ?? pickShortString(record.command)
+    ?? JSON.stringify(input).slice(0, 200)
+}
+
+function summarizeRuntimeToolEvent(value: unknown): EventToolSummary | null {
+  if (!value || typeof value !== 'object') return null
+  const record = value as Record<string, unknown>
+
+  const directTool = pickShortString(record.tool_name)
+    ?? pickShortString(record.tool)
+    ?? pickShortString(record.name)
+    ?? pickShortString(record.type)
+  if (
+    directTool
+    && (
+      record.tool_input !== undefined
+      || record.input !== undefined
+      || record.arguments !== undefined
+      || record.command !== undefined
+      || record.cmd !== undefined
+      || record.file_path !== undefined
+      || record.path !== undefined
+    )
+  ) {
+    const input = record.tool_input ?? record.input ?? record.arguments ?? record
+    return { tool: directTool, summary: summarizeToolInput(directTool, input) }
+  }
+
+  for (const key of ['item', 'message', 'delta', 'payload', 'result', 'call']) {
+    const nested = summarizeRuntimeToolEvent(record[key])
+    if (nested) return nested
+  }
+
+  for (const key of ['content', 'items', 'events', 'output']) {
+    const nested = record[key]
+    if (!Array.isArray(nested)) continue
+    for (const item of nested) {
+      const summary = summarizeRuntimeToolEvent(item)
+      if (summary) return summary
+    }
+  }
+
+  return null
+}
+
 export function buildGoalPrompt(agentName: string, goal?: string): string | undefined {
   if (!goal) return undefined
 
@@ -520,6 +585,10 @@ export class AgentProcess {
       this.updateTokenUsage(event);
 
       if (event.type === 'item.completed') {
+        const tool = summarizeRuntimeToolEvent(event);
+        if (tool) {
+          log.info('tool', { agent, tool: tool.tool, summary: tool.summary });
+        }
         const item = event.item;
         const summary = typeof item === 'string'
           ? item.slice(0, 200)
