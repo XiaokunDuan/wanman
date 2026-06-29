@@ -854,7 +854,14 @@ pnpm test --coverage  # or pytest --cov, go test -cover, etc.
 # 5. Commit (small, focused commits)
 git add -A && git commit -m "<type>: <description>"
 
-# 6. Push and open PR - include coverage in PR body
+# 6. Sync with latest main before publishing
+git fetch origin
+git rebase origin/main  # or merge origin/main if the project requires merge commits
+
+# 7. Re-run the relevant verification after the sync
+pnpm test --coverage  # or pytest --cov, go test -cover, etc.
+
+# 8. Push and open PR - include coverage in PR body
 git push -u origin wanman/<task-slug>
 gh pr create --title "<task title>" --body "$(cat <<PRBODY
 ## Changes
@@ -865,7 +872,10 @@ gh pr create --title "<task title>" --body "$(cat <<PRBODY
 PRBODY
 )"
 
-# 7. Notify CTO for review (NOT CEO)
+# 9. Confirm PR checks are not immediately failing before marking review-ready
+gh pr checks --watch
+
+# 10. Notify CTO for review (NOT CEO)
 wanman capsule update <capsule-id> --status in_review
 wanman send cto "PR ready for review: <pr-url>"
 \`\`\`
@@ -884,7 +894,8 @@ wanman send cto "PR ready for review: <pr-url>"
 - If you discover important out-of-scope work, finish the in-scope change first, then report the follow-up to CEO.
 - If tests are green but the task only optimizes a local metric, proactively suggest higher-value next steps to CEO
 - Aim for real, deliverable changes - do not just submit abstract suggestions
-- Always run tests before pushing; do not open PRs with broken tests
+- Always run tests before pushing and again after syncing with origin/main; do not open PRs from stale or broken branches
+- If origin/main already contains the task outcome, report that fact instead of opening a redundant PR
 - After CTO requests changes, fix and re-push to the same branch - do not create a new PR
 `, paths.cliCommand)
     case 'devops':

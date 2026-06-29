@@ -9,6 +9,7 @@ import {
   buildLocalDashboardState,
   buildPrNudgeSignature,
   collectPrNudgeRecipients,
+  getLocalCompletionReason,
   hasLocalProgress,
   materializeLocalTakeoverProject,
   maybeNudgeLocalPrExecution,
@@ -33,8 +34,17 @@ function makeState(overrides: Partial<LocalObservationState> = {}): LocalObserva
     logs: [],
     activeBranch: undefined,
     branchAhead: 0,
+    branchBehind: 0,
+    baseAhead: 0,
+    baseBehind: 0,
     hasUpstream: false,
     prUrl: undefined,
+    prState: undefined,
+    prCheckState: 'none',
+    headSha: 'head',
+    baseSha: 'base',
+    headCiState: 'none',
+    baseCiState: 'none',
     modifiedFiles: [],
     ...overrides,
   }
@@ -57,7 +67,11 @@ describe('parseLocalGitStatus', () => {
       activeBranch: 'wanman/task',
       branchAhead: 2,
       branchBehind: 1,
+      baseAhead: 0,
+      baseBehind: 0,
       hasUpstream: true,
+      headSha: undefined,
+      baseSha: undefined,
       modifiedFiles: ['src/app.ts', 'src/new.ts', 'conflicted.ts', 'notes.md', 'ignored.log'],
     })
   })
@@ -134,6 +148,91 @@ describe('local takeover progress helpers', () => {
     expect(state.tasks).toHaveLength(1)
     expect(state.artifacts).toHaveLength(1)
   })
+
+  it('recognizes clean completion on green main, green PR, or absorbed branches', () => {
+    const doneTask = { id: '1', title: 'Done', status: 'done', assignee: 'dev', priority: 1 }
+
+    expect(getLocalCompletionReason(makeState({
+      activeBranch: 'main',
+      tasks: [doneTask],
+      headCiState: 'success',
+      baseCiState: 'success',
+    }))).toContain('green CI')
+
+    expect(getLocalCompletionReason(makeState({
+      activeBranch: 'wanman/task',
+      tasks: [doneTask],
+      prUrl: 'https://github.com/acme/app/pull/1',
+      prCheckState: 'success',
+      baseCiState: 'pending',
+    }))).toContain('PR branch is current')
+
+    expect(getLocalCompletionReason(makeState({
+      activeBranch: 'wanman/task',
+      tasks: [doneTask],
+      baseAhead: 0,
+      baseBehind: 2,
+      baseCiState: 'success',
+    }))).toContain('origin/main')
+  })
+
+  it('does not complete when work is dirty, unpushed, unfinished, or failing checks', () => {
+    const doneTask = { id: '1', title: 'Done', status: 'done', assignee: 'dev', priority: 1 }
+
+    expect(getLocalCompletionReason(makeState({
+      activeBranch: 'main',
+      tasks: [{ ...doneTask, status: 'in_progress' }],
+      headCiState: 'success',
+      baseCiState: 'success',
+    }))).toBeUndefined()
+    expect(getLocalCompletionReason(makeState({
+      activeBranch: 'main',
+      tasks: [doneTask],
+      modifiedFiles: ['src/app.ts'],
+      headCiState: 'success',
+      baseCiState: 'success',
+    }))).toBeUndefined()
+    expect(getLocalCompletionReason(makeState({
+      activeBranch: 'main',
+      tasks: [doneTask],
+      branchAhead: 1,
+      headCiState: 'success',
+      baseCiState: 'success',
+    }))).toBeUndefined()
+    expect(getLocalCompletionReason(makeState({
+      activeBranch: 'main',
+      tasks: [doneTask],
+      branchBehind: 1,
+      headCiState: 'success',
+      baseCiState: 'success',
+    }))).toBeUndefined()
+    expect(getLocalCompletionReason(makeState({
+      activeBranch: 'main',
+      tasks: [doneTask],
+      headCiState: 'failure',
+      baseCiState: 'failure',
+    }))).toBeUndefined()
+    expect(getLocalCompletionReason(makeState({
+      activeBranch: 'wanman/task',
+      tasks: [doneTask],
+      prUrl: 'https://github.com/acme/app/pull/1',
+      prCheckState: 'failure',
+    }))).toBeUndefined()
+    expect(getLocalCompletionReason(makeState({
+      activeBranch: 'wanman/task',
+      tasks: [doneTask],
+      prUrl: 'https://github.com/acme/app/pull/1',
+      prCheckState: 'success',
+      baseBehind: 1,
+    }))).toBeUndefined()
+    expect(getLocalCompletionReason(makeState({
+      activeBranch: 'wanman/task',
+      tasks: [doneTask],
+      hasUpstream: true,
+      baseAhead: 1,
+      baseCiState: 'success',
+    }))).toBeUndefined()
+  })
 })
 
 describe('maybeNudgeLocalPrExecution', () => {
@@ -162,23 +261,164 @@ describe('maybeNudgeLocalPrExecution', () => {
       to: 'dev',
       priority: 'steer',
     }))
+    expect(sendMessage.mock.calls[0]?.[0]?.payload).toContain('rebase or merge origin/main')
+    expect(sendMessage.mock.calls[0]?.[0]?.payload).toContain('create a PR only if verification passes')
     expect(nudgeState.lastSignature).toBeDefined()
 
     await expect(maybeNudgeLocalPrExecution({ sendMessage } as never, state, nudgeState)).resolves.toBe(false)
     expect(sendMessage).toHaveBeenCalledTimes(3)
   })
 
-  it('does not send PR nudges when a PR already exists or no branch work is ready', async () => {
+  it('does not send PR nudges when an existing PR is not actionable or no branch work is ready', async () => {
     const sendMessage = vi.fn().mockResolvedValue(undefined)
 
     await expect(maybeNudgeLocalPrExecution(
       { sendMessage } as never,
-      makeState({ prUrl: 'https://github.com/acme/app/pull/1' }),
+      makeState({
+        prUrl: 'https://github.com/acme/app/pull/1',
+        prCheckState: 'pending',
+        tasks: [{ id: '1', title: 'Done', status: 'done', assignee: 'dev', priority: 1 }],
+      }),
       {},
     )).resolves.toBe(false)
     await expect(maybeNudgeLocalPrExecution(
       { sendMessage } as never,
       makeState({ activeBranch: 'main', tasks: [{ id: '1', title: 'Task', status: 'todo', assignee: 'dev', priority: 1 }] }),
+      {},
+    )).resolves.toBe(false)
+
+    expect(sendMessage).not.toHaveBeenCalled()
+  })
+
+  it('nudges existing PRs when they are behind main, failing checks, or still have open tasks', async () => {
+    const behindSendMessage = vi.fn().mockResolvedValue(undefined)
+    const failingSendMessage = vi.fn().mockResolvedValue(undefined)
+    const openTaskSendMessage = vi.fn().mockResolvedValue(undefined)
+    const doneTask = { id: '1', title: 'Done', status: 'done', assignee: 'dev', priority: 1 }
+
+    await expect(maybeNudgeLocalPrExecution(
+      { sendMessage: behindSendMessage } as never,
+      makeState({
+        activeBranch: 'wanman/task',
+        prUrl: 'https://github.com/acme/app/pull/1',
+        prCheckState: 'success',
+        baseBehind: 2,
+        tasks: [doneTask],
+      }),
+      {},
+    )).resolves.toBe(true)
+    expect(behindSendMessage.mock.calls[0]?.[0]?.payload).toContain('not completion-ready')
+    expect(behindSendMessage.mock.calls[0]?.[0]?.payload).toContain('rebase or merge origin/main')
+
+    await expect(maybeNudgeLocalPrExecution(
+      { sendMessage: failingSendMessage } as never,
+      makeState({
+        activeBranch: 'wanman/task',
+        prUrl: 'https://github.com/acme/app/pull/1',
+        prCheckState: 'failure',
+        tasks: [doneTask],
+      }),
+      {},
+    )).resolves.toBe(true)
+    expect(failingSendMessage.mock.calls[0]?.[0]?.payload).toContain('PR checks are failure')
+
+    await expect(maybeNudgeLocalPrExecution(
+      { sendMessage: openTaskSendMessage } as never,
+      makeState({
+        activeBranch: 'wanman/task',
+        prUrl: 'https://github.com/acme/app/pull/1',
+        prCheckState: 'success',
+        tasks: [{ id: '2', title: 'Implement', status: 'in_progress', assignee: 'dev', priority: 1 }],
+      }),
+      {},
+    )).resolves.toBe(true)
+    expect(openTaskSendMessage.mock.calls[0]?.[0]?.payload).toContain('still need wanman task done')
+  })
+
+  it('does not nudge stale completed branches that are behind main or already closed', async () => {
+    const sendMessage = vi.fn().mockResolvedValue(undefined)
+    const doneTask = { id: '1', title: 'Done', status: 'done', assignee: 'dev', priority: 1 }
+
+    await expect(maybeNudgeLocalPrExecution(
+      { sendMessage } as never,
+      makeState({
+        activeBranch: 'wanman/task',
+        hasUpstream: true,
+        tasks: [doneTask],
+        baseAhead: 0,
+        baseBehind: 2,
+        baseCiState: 'success',
+      }),
+      {},
+    )).resolves.toBe(false)
+
+    await expect(maybeNudgeLocalPrExecution(
+      { sendMessage } as never,
+      makeState({
+        activeBranch: 'wanman/task',
+        hasUpstream: true,
+        tasks: [doneTask],
+        baseBehind: 1,
+        prState: 'CLOSED',
+      }),
+      {},
+    )).resolves.toBe(false)
+
+    expect(sendMessage).not.toHaveBeenCalled()
+  })
+
+  it('nudges completed pushed branches that still have unmerged work over main', async () => {
+    const sendMessage = vi.fn().mockResolvedValue(undefined)
+    const doneTask = { id: '1', title: 'Done', status: 'done', assignee: 'dev', priority: 1 }
+
+    await expect(maybeNudgeLocalPrExecution(
+      { sendMessage } as never,
+      makeState({
+        activeBranch: 'wanman/task',
+        hasUpstream: true,
+        tasks: [doneTask],
+        baseAhead: 1,
+        baseCiState: 'success',
+      }),
+      {},
+    )).resolves.toBe(true)
+
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      from: 'takeover-pr-allocator',
+      to: 'ceo',
+    }))
+  })
+
+  it('nudges feature branches with local commits over main even before upstream is configured', async () => {
+    const sendMessage = vi.fn().mockResolvedValue(undefined)
+
+    await expect(maybeNudgeLocalPrExecution(
+      { sendMessage } as never,
+      makeState({
+        activeBranch: 'wanman/task',
+        hasUpstream: false,
+        tasks: [{ id: '1', title: 'Done', status: 'done', assignee: 'dev', priority: 1 }],
+        baseAhead: 1,
+      }),
+      {},
+    )).resolves.toBe(true)
+
+    expect(sendMessage.mock.calls[0]?.[0]?.payload).toContain('no upstream or PR yet')
+  })
+
+  it('does not nudge pushed branches with no diff over main', async () => {
+    const sendMessage = vi.fn().mockResolvedValue(undefined)
+
+    await expect(maybeNudgeLocalPrExecution(
+      { sendMessage } as never,
+      makeState({
+        activeBranch: 'wanman/task',
+        hasUpstream: true,
+        tasks: [{ id: '1', title: 'Implement', status: 'in_progress', assignee: 'dev', priority: 1 }],
+        baseAhead: 0,
+        baseBehind: 0,
+      }),
       {},
     )).resolves.toBe(false)
 

@@ -47,7 +47,7 @@ describe('runLocal', () => {
     return dir
   }
 
-  it('runs the local takeover loop until a PR is observed', async () => {
+  it('runs the local takeover loop until a completion-ready PR is observed', async () => {
     const project = makeTmpDir()
     const wanmanDir = path.join(project, '.wanman')
     const worktree = path.join(wanmanDir, 'worktree')
@@ -61,21 +61,48 @@ describe('runLocal', () => {
     fs.writeFileSync(path.join(project, 'packages', 'runtime', 'dist', 'entrypoint.js'), '')
     fs.writeFileSync(path.join(wanmanDir, 'agents.json'), JSON.stringify({ agents: [] }))
 
+    const gitStatusResponses = [
+      [
+        '# branch.head wanman/task',
+        '# branch.upstream origin/wanman/task',
+        '# branch.ab +0 -0',
+      ].join('\n'),
+      [
+        '# branch.head wanman/task',
+        '# branch.upstream origin/wanman/task',
+        '# branch.ab +1 -0',
+        '1 .M N... 100644 100644 100644 abc abc src/app.ts',
+      ].join('\n'),
+      [
+        '# branch.head wanman/task',
+        '# branch.upstream origin/wanman/task',
+        '# branch.ab +0 -0',
+      ].join('\n'),
+    ]
+    let lastGitStatusResponse = gitStatusResponses[0] ?? ''
     const prResponses = [
+      '[]',
       '[]',
       JSON.stringify([{ url: 'https://github.com/acme/app/pull/7' }]),
     ]
+    let lastPrResponse = '[]'
     execSyncMock.mockImplementation((command: string) => {
       if (command.includes('command -v')) return ''
       if (command.includes('git status --porcelain')) {
-        return [
-          '# branch.head wanman/task',
-          '# branch.upstream origin/wanman/task',
-          '# branch.ab +1 -0',
-          '1 .M N... 100644 100644 100644 abc abc src/app.ts',
-        ].join('\n')
+        const response = gitStatusResponses.shift() ?? lastGitStatusResponse
+        lastGitStatusResponse = response
+        return response
       }
-      if (command.includes('gh pr list')) return prResponses.shift() ?? prResponses.at(-1) ?? '[]'
+      if (command.includes('git rev-parse')) return 'abc\n'
+      if (command.includes('git rev-list')) return '0\t1\n'
+      if (command.includes('gh run list')) return '[]'
+      if (command.includes('gh pr list')) {
+        const response = prResponses.shift() ?? lastPrResponse
+        lastPrResponse = response
+        return response === '[]'
+          ? response
+          : JSON.stringify([{ url: 'https://github.com/acme/app/pull/7', state: 'OPEN', statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }] }])
+      }
       return ''
     })
 
@@ -182,5 +209,120 @@ describe('runLocal', () => {
       signalMode: 'forward_only',
     }))
     expect(fs.readFileSync(path.join(wanmanDir, 'live-dashboard.txt'), 'utf-8')).toContain('Implement')
+  })
+
+  it('stops without PR nudging when all tasks are done and main has green CI', async () => {
+    const project = makeTmpDir()
+    const wanmanDir = path.join(project, '.wanman')
+    const worktree = path.join(wanmanDir, 'worktree')
+    fs.mkdirSync(path.join(project, 'packages', 'cli', 'dist'), { recursive: true })
+    fs.mkdirSync(path.join(project, 'packages', 'runtime', 'dist'), { recursive: true })
+    fs.mkdirSync(path.join(project, 'node_modules'), { recursive: true })
+    fs.mkdirSync(path.join(wanmanDir, 'agents'), { recursive: true })
+    fs.mkdirSync(path.join(wanmanDir, 'skills'), { recursive: true })
+    fs.mkdirSync(worktree, { recursive: true })
+    fs.writeFileSync(path.join(project, 'packages', 'cli', 'dist', 'index.js'), '')
+    fs.writeFileSync(path.join(project, 'packages', 'runtime', 'dist', 'entrypoint.js'), '')
+    fs.writeFileSync(path.join(wanmanDir, 'agents.json'), JSON.stringify({ agents: [] }))
+
+    execSyncMock.mockImplementation((command: string) => {
+      if (command.includes('command -v')) return ''
+      if (command.includes('git status --porcelain')) {
+        return [
+          '# branch.head main',
+          '# branch.upstream origin/main',
+          '# branch.ab +0 -0',
+        ].join('\n')
+      }
+      if (command.includes('git rev-parse')) return 'abc\n'
+      if (command.includes('git rev-list')) return '0\t0\n'
+      if (command.includes('gh run list')) return JSON.stringify([{ status: 'completed', conclusion: 'success' }])
+      if (command.includes('gh pr list')) return '[]'
+      return ''
+    })
+
+    runLocalSupervisorSessionMock.mockImplementation(async (params: RunLocalSupervisorSessionParams) => {
+      const child = new EventEmitter()
+      const runtime = {
+        getHealth: vi.fn().mockResolvedValue({
+          agents: [{ name: 'ceo', state: 'idle', lifecycle: '24/7' }],
+          runtime: { completedRuns: 1 },
+          loop: { runId: 'run-1' },
+        }),
+        listTasks: vi.fn().mockResolvedValue([{ id: '1', title: 'Implement', status: 'done', assignee: 'dev', priority: 1 }]),
+        listInitiatives: vi.fn().mockResolvedValue([]),
+        listCapsules: vi.fn().mockResolvedValue([]),
+        listArtifacts: vi.fn().mockResolvedValue([]),
+        createInitiative: vi.fn().mockResolvedValue(undefined),
+        sendMessage: vi.fn().mockResolvedValue(undefined),
+        spawnAgent: vi.fn().mockResolvedValue(undefined),
+        updateTask: vi.fn().mockResolvedValue(undefined),
+      }
+      const supervisor = {
+        readLogs: vi.fn().mockResolvedValue({ lines: ['ready'], cursor: 1 }),
+      }
+      const context = {
+        supervisor,
+        runtime,
+        child,
+        port: 3333,
+        endpoint: 'http://127.0.0.1:3333',
+        entrypoint: '/tmp/entrypoint.js',
+        isShuttingDown: () => false,
+      }
+
+      await params.onStarted?.(context as never)
+      await params.onHealthy?.(context as never)
+      await params.run(context as never)
+
+      expect(runtime.sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({
+        from: 'takeover-pr-allocator',
+      }))
+    })
+
+    const profile: ProjectProfile = {
+      path: project,
+      languages: ['typescript'],
+      packageManagers: ['pnpm'],
+      frameworks: [],
+      ci: ['github-actions'],
+      testFrameworks: [],
+      hasReadme: true,
+      hasClaudeMd: false,
+      hasDocs: false,
+      issueTracker: 'github',
+      githubRemote: 'https://github.com/acme/app.git',
+      readmeExcerpt: 'App',
+      codeRoots: ['src'],
+      packageScripts: ['test'],
+    }
+    const generated: GeneratedAgentConfig = {
+      runtime: 'codex',
+      goal: 'Ship project',
+      intent: {
+        projectName: 'app',
+        summary: 'Ship project',
+        canonicalDocs: [],
+        roadmapDocs: [],
+        codeRoots: ['src'],
+        packageScripts: ['test'],
+        strategicThemes: ['quality'],
+        mission: 'Ship project',
+      },
+      agents: [],
+    }
+
+    await runLocal(profile, generated, wanmanDir, {
+      loops: 3,
+      pollInterval: 0,
+      output: path.join(project, 'out'),
+      keep: false,
+      noBrain: true,
+      infinite: false,
+      errorLimit: 3,
+      runtime: 'codex',
+      codexModel: 'gpt-test',
+      codexReasoningEffort: 'medium',
+    })
   })
 })

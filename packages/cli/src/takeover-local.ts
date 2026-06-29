@@ -32,6 +32,9 @@ import {
 import { formatDashboard, renderDashboard, type DashboardState } from './tui/dashboard.js'
 
 const MAX_DEV_WORKERS = 3
+const SUCCESSFUL_CHECK_CONCLUSIONS = new Set(['success', 'skipped', 'neutral'])
+
+type CheckState = 'success' | 'failure' | 'pending' | 'none' | 'unknown'
 
 export interface LocalObservationState {
   health: RuntimeHealth
@@ -42,8 +45,17 @@ export interface LocalObservationState {
   logs: string[]
   activeBranch?: string
   branchAhead: number
+  branchBehind: number
+  baseAhead: number
+  baseBehind: number
   hasUpstream: boolean
   prUrl?: string
+  prState?: string
+  prCheckState: CheckState
+  headSha?: string
+  baseSha?: string
+  headCiState: CheckState
+  baseCiState: CheckState
   modifiedFiles: string[]
 }
 
@@ -51,8 +63,18 @@ interface LocalGitState {
   activeBranch?: string
   branchAhead: number
   branchBehind: number
+  baseAhead: number
+  baseBehind: number
   hasUpstream: boolean
   modifiedFiles: string[]
+  headSha?: string
+  baseSha?: string
+}
+
+interface LocalPullRequestState {
+  url?: string
+  state?: string
+  checkState: CheckState
 }
 
 interface LocalPrNudgeState {
@@ -138,13 +160,58 @@ function snapshotWorktree(state: Pick<LocalObservationState, 'activeBranch' | 'b
   })
 }
 
+function summarizeChecks(checks: Array<Record<string, unknown>>): CheckState {
+  if (checks.length === 0) return 'none'
+
+  let sawCompleted = false
+  for (const check of checks) {
+    const status = String(check['status'] ?? '').toLowerCase()
+    const conclusion = String(check['conclusion'] ?? '').toLowerCase()
+    const state = String(check['state'] ?? '').toLowerCase()
+    if (state) {
+      if (state === 'success') {
+        sawCompleted = true
+        continue
+      }
+      if (state === 'pending' || state === 'expected') return 'pending'
+      return 'failure'
+    }
+    if (status && status !== 'completed') return 'pending'
+    if (!conclusion) return 'pending'
+    sawCompleted = true
+    if (!SUCCESSFUL_CHECK_CONCLUSIONS.has(conclusion)) return 'failure'
+  }
+
+  return sawCompleted ? 'success' : 'pending'
+}
+
+function summarizeRuns(runs: Array<Record<string, unknown>>): CheckState {
+  if (runs.length === 0) return 'none'
+
+  let sawCompleted = false
+  for (const run of runs) {
+    const status = String(run['status'] ?? '').toLowerCase()
+    const conclusion = String(run['conclusion'] ?? '').toLowerCase()
+    if (status && status !== 'completed') return 'pending'
+    if (!conclusion) return 'pending'
+    sawCompleted = true
+    if (!SUCCESSFUL_CHECK_CONCLUSIONS.has(conclusion)) return 'failure'
+  }
+
+  return sawCompleted ? 'success' : 'pending'
+}
+
 export function parseLocalGitStatus(raw: string): LocalGitState {
   const state: LocalGitState = {
     activeBranch: undefined,
     branchAhead: 0,
     branchBehind: 0,
+    baseAhead: 0,
+    baseBehind: 0,
     hasUpstream: false,
     modifiedFiles: [],
+    headSha: undefined,
+    baseSha: undefined,
   }
 
   const seenFiles = new Set<string>()
@@ -181,19 +248,25 @@ export function parseLocalGitStatus(raw: string): LocalGitState {
   return state
 }
 
-async function detectPullRequestUrl(worktreePath: string, branch?: string): Promise<string | undefined> {
-  if (!branch) return undefined
+async function detectPullRequestState(worktreePath: string, branch?: string): Promise<LocalPullRequestState> {
+  if (!branch) return { checkState: 'none' }
   try {
-    const raw = execSync(`gh pr list --head ${JSON.stringify(branch)} --json url --limit 1`, {
+    const raw = execSync(`gh pr list --head ${JSON.stringify(branch)} --state all --json url,state,statusCheckRollup --limit 5`, {
       cwd: worktreePath,
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
     }).trim()
-    if (!raw) return undefined
-    const parsed = JSON.parse(raw) as Array<{ url?: string }>
-    return parsed[0]?.url
+    if (!raw) return { checkState: 'none' }
+    const parsed = JSON.parse(raw) as Array<{ url?: string; state?: string; statusCheckRollup?: Array<Record<string, unknown>> }>
+    const open = parsed.find(pr => String(pr.state ?? '').toUpperCase() === 'OPEN')
+    const selected = open ?? parsed[0]
+    return {
+      url: selected?.url,
+      state: selected?.state,
+      checkState: summarizeChecks(selected?.statusCheckRollup ?? []),
+    }
   } catch {
-    return undefined
+    return { checkState: 'unknown' }
   }
 }
 
@@ -223,15 +296,71 @@ async function readLocalGitState(worktreePath: string): Promise<LocalGitState> {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
     })
-    return parseLocalGitStatus(raw)
+    const state = parseLocalGitStatus(raw)
+    state.headSha = readGitRef(worktreePath, 'HEAD')
+    state.baseSha = readGitRef(worktreePath, 'origin/main')
+    if (state.baseSha && state.headSha) {
+      const divergence = readGitDivergence(worktreePath, 'origin/main', 'HEAD')
+      state.baseBehind = divergence.leftOnly
+      state.baseAhead = divergence.rightOnly
+    }
+    return state
   } catch {
     return {
       activeBranch: undefined,
       branchAhead: 0,
       branchBehind: 0,
+      baseAhead: 0,
+      baseBehind: 0,
       hasUpstream: false,
       modifiedFiles: [],
+      headSha: undefined,
+      baseSha: undefined,
     }
+  }
+}
+
+function readGitRef(worktreePath: string, ref: string): string | undefined {
+  try {
+    return execSync(`git rev-parse --verify ${JSON.stringify(ref)}`, {
+      cwd: worktreePath,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim() || undefined
+  } catch {
+    return undefined
+  }
+}
+
+function readGitDivergence(worktreePath: string, leftRef: string, rightRef: string): { leftOnly: number; rightOnly: number } {
+  try {
+    const raw = execSync(`git rev-list --left-right --count ${JSON.stringify(leftRef)}...${JSON.stringify(rightRef)}`, {
+      cwd: worktreePath,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim()
+    const [left, right] = raw.split(/\s+/)
+    return {
+      leftOnly: Number.parseInt(left ?? '0', 10) || 0,
+      rightOnly: Number.parseInt(right ?? '0', 10) || 0,
+    }
+  } catch {
+    return { leftOnly: 0, rightOnly: 0 }
+  }
+}
+
+function detectCommitCiState(worktreePath: string, sha?: string): CheckState {
+  if (!sha) return 'unknown'
+  try {
+    const raw = execSync(`gh run list --commit ${JSON.stringify(sha)} --limit 20 --json status,conclusion`, {
+      cwd: worktreePath,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim()
+    if (!raw) return 'none'
+    return summarizeRuns(JSON.parse(raw) as Array<Record<string, unknown>>)
+  } catch {
+    return 'unknown'
   }
 }
 
@@ -282,7 +411,11 @@ export async function collectLocalObservationState(
   const capsules = await runtime.listCapsules().catch(() => [])
   const artifacts = await runtime.listArtifacts().catch(() => [])
   const gitState = await readLocalGitState(worktreePath)
-  const prUrl = await detectPullRequestUrl(worktreePath, gitState.activeBranch)
+  const pr = await detectPullRequestState(worktreePath, gitState.activeBranch)
+  const headCiState = detectCommitCiState(worktreePath, gitState.headSha)
+  const baseCiState = gitState.baseSha === gitState.headSha
+    ? headCiState
+    : detectCommitCiState(worktreePath, gitState.baseSha)
   return {
     health,
     tasks,
@@ -292,8 +425,17 @@ export async function collectLocalObservationState(
     logs: logLines.slice(-50),
     activeBranch: gitState.activeBranch,
     branchAhead: gitState.branchAhead,
+    branchBehind: gitState.branchBehind,
+    baseAhead: gitState.baseAhead,
+    baseBehind: gitState.baseBehind,
     hasUpstream: gitState.hasUpstream,
-    prUrl,
+    prUrl: String(pr.state ?? '').toUpperCase() === 'OPEN' ? pr.url : undefined,
+    prState: pr.state,
+    prCheckState: pr.checkState,
+    headSha: gitState.headSha,
+    baseSha: gitState.baseSha,
+    headCiState,
+    baseCiState,
     modifiedFiles: gitState.modifiedFiles,
   }
 }
@@ -336,6 +478,60 @@ function isTakeoverFeatureBranch(branch?: string): boolean {
   return !!branch && /^(wanman|fix|feat|chore|docs)\//.test(branch)
 }
 
+function isPrimaryBranch(branch?: string): boolean {
+  return branch === 'main' || branch === 'master'
+}
+
+function allTasksDone(state: LocalObservationState): boolean {
+  return state.tasks.length > 0 && state.tasks.every(task => task.status === 'done')
+}
+
+function ciIsAcceptableForCompletion(state: CheckState): boolean {
+  return state === 'success' || state === 'none'
+}
+
+/** @internal exported for testing */
+export function getLocalCompletionReason(state: LocalObservationState): string | undefined {
+  if (!allTasksDone(state)) return undefined
+  if (state.modifiedFiles.length > 0) return undefined
+  if (state.branchAhead > 0) return undefined
+  if (state.branchBehind > 0) return undefined
+
+  if (isPrimaryBranch(state.activeBranch)) {
+    if (state.headCiState === 'success') {
+      return `all tasks are done and ${state.activeBranch} is clean with green CI`
+    }
+    if (state.headCiState === 'none') {
+      return `all tasks are done and ${state.activeBranch} is clean with no CI runs`
+    }
+  }
+
+  if (state.prUrl) {
+    if (state.baseSha && state.baseBehind > 0) return undefined
+    return ciIsAcceptableForCompletion(state.prCheckState)
+      ? `all tasks are done and PR branch is current with origin/main; PR checks ${state.prCheckState === 'success' ? 'passed' : 'are not configured'}: ${state.prUrl}`
+      : undefined
+  }
+
+  if (state.baseSha && state.baseAhead === 0 && ciIsAcceptableForCompletion(state.baseCiState)) {
+    return `all tasks are done and origin/main already contains the branch with ${state.baseCiState === 'success' ? 'green CI' : 'no CI runs'}`
+  }
+
+  return undefined
+}
+
+function shouldSuppressPrNudgeForStaleCompletedBranch(state: LocalObservationState): boolean {
+  if (!allTasksDone(state)) return false
+  if (state.modifiedFiles.length > 0 || state.branchAhead > 0) return false
+  if (!isTakeoverFeatureBranch(state.activeBranch)) return false
+  if (!state.baseSha || state.baseAhead > 0) return false
+  if (state.prUrl && state.baseBehind > 0) return false
+  if (state.prUrl && (state.prCheckState === 'failure' || state.prCheckState === 'unknown')) return false
+  if (state.prUrl && state.tasks.some(task => task.status !== 'done')) return false
+  if (state.prState && String(state.prState).toUpperCase() !== 'OPEN') return true
+  return ciIsAcceptableForCompletion(state.baseCiState)
+}
+
 /** @internal exported for testing */
 export function collectPrNudgeRecipients(state: LocalObservationState): string[] {
   const recipients = new Set<string>()
@@ -355,8 +551,13 @@ export function buildPrNudgeSignature(state: LocalObservationState): string {
   return JSON.stringify({
     branch: state.activeBranch ?? null,
     branchAhead: state.branchAhead,
+    branchBehind: state.branchBehind,
+    baseAhead: state.baseAhead,
+    baseBehind: state.baseBehind,
     hasUpstream: state.hasUpstream,
     modifiedFiles: state.modifiedFiles,
+    prCheckState: state.prCheckState,
+    prUrl: state.prUrl ?? null,
     recipients: collectPrNudgeRecipients(state),
     tasks: state.tasks
       .filter(task => task.assignee && (task.assignee === 'dev' || task.assignee === 'devops' || /^dev-\d+$/.test(task.assignee)))
@@ -385,13 +586,25 @@ export async function maybeNudgeLocalPrExecution(
   state: LocalObservationState,
   nudgeState: LocalPrNudgeState,
 ): Promise<boolean> {
-  if (state.prUrl) return false
+  if (shouldSuppressPrNudgeForStaleCompletedBranch(state)) return false
 
   const onFeatureBranch = isTakeoverFeatureBranch(state.activeBranch)
   const hasDirtyFiles = state.modifiedFiles.length > 0
   const hasLocalCommitsToPush = state.branchAhead > 0
-  const hasBranchReadyForPr = onFeatureBranch && state.hasUpstream
-  if (!hasDirtyFiles && !hasLocalCommitsToPush && !hasBranchReadyForPr) return false
+  const hasLocalBranchBehindRemote = state.branchBehind > 0
+  const hasBranchReadyForPr = !state.prUrl && onFeatureBranch && state.baseAhead > 0
+  const hasPrBehindBase = !!state.prUrl && state.baseSha !== undefined && state.baseBehind > 0
+  const hasPrChecksNeedingAttention = !!state.prUrl && (state.prCheckState === 'failure' || state.prCheckState === 'unknown')
+  const hasPrWithOpenTasks = !!state.prUrl && state.tasks.some(task => task.status !== 'done')
+  if (
+    !hasDirtyFiles &&
+    !hasLocalCommitsToPush &&
+    !hasLocalBranchBehindRemote &&
+    !hasBranchReadyForPr &&
+    !hasPrBehindBase &&
+    !hasPrChecksNeedingAttention &&
+    !hasPrWithOpenTasks
+  ) return false
 
   const recipients = collectPrNudgeRecipients(state)
   if (recipients.length === 0) return false
@@ -404,24 +617,48 @@ export async function maybeNudgeLocalPrExecution(
 
   const summary = state.modifiedFiles.slice(0, 6).join(', ')
   const contextLines: string[] = []
+  if (state.prUrl) {
+    contextLines.push(`PR: ${state.prUrl}.`)
+  }
   if (hasDirtyFiles) {
     contextLines.push(`Modified files: ${summary}${state.modifiedFiles.length > 6 ? ', ...' : ''}.`)
   }
   if (hasLocalCommitsToPush) {
     contextLines.push(`Current branch is ahead of origin by ${state.branchAhead} commit${state.branchAhead === 1 ? '' : 's'}.`)
   }
+  if (hasLocalBranchBehindRemote) {
+    contextLines.push(`Current branch is behind its upstream by ${state.branchBehind} commit${state.branchBehind === 1 ? '' : 's'}; fetch and sync before completion.`)
+  }
   if (hasBranchReadyForPr && !hasDirtyFiles && !hasLocalCommitsToPush) {
-    contextLines.push(`Feature branch ${state.activeBranch} is pushed to origin but still has no PR.`)
+    contextLines.push(
+      state.hasUpstream
+        ? `Feature branch ${state.activeBranch} is pushed to origin but still has no PR.`
+        : `Feature branch ${state.activeBranch} has commits over origin/main but no upstream or PR yet.`,
+    )
+  }
+  if (state.baseBehind > 0) {
+    contextLines.push(`Feature branch is behind origin/main by ${state.baseBehind} commit${state.baseBehind === 1 ? '' : 's'}; sync it before PR creation or completion.`)
+  }
+  if (hasPrChecksNeedingAttention) {
+    contextLines.push(`PR checks are ${state.prCheckState}; do not treat the takeover as complete yet.`)
+  }
+  if (hasPrWithOpenTasks) {
+    const openTasks = state.tasks.filter(task => task.status !== 'done').length
+    contextLines.push(`${openTasks} task${openTasks === 1 ? '' : 's'} still need wanman task done before completion.`)
   }
 
-  const nextAction = onFeatureBranch
-    ? 'Immediately commit any remaining verified changes, push the task branch to origin, create a PR with coverage notes, then notify cto with the PR URL.'
-    : 'Immediately switch from detached HEAD to a task branch (`wanman/<task-slug>`), commit the verified changes, push to origin, create a PR with coverage notes, then notify cto with the PR URL.'
+  const nextAction = state.prUrl
+    ? 'Immediately fetch origin, rebase or merge origin/main, rerun the relevant verification commands locally, push the synchronized branch, wait for PR checks to pass or document that no checks are configured, then mark the remaining tasks done and notify cto.'
+    : onFeatureBranch
+    ? 'Immediately commit any remaining verified changes, fetch origin, rebase or merge origin/main, run the relevant verification commands locally, push the synchronized task branch to origin, create a PR only if verification passes, then notify cto with the PR URL.'
+    : 'Immediately switch from detached HEAD to a task branch (`wanman/<task-slug>`), commit the verified changes, fetch origin, rebase or merge origin/main, run the relevant verification commands locally, push to origin, create a PR only if verification passes, then notify cto with the PR URL.'
   const payload = [
-    'Takeover has implementation progress but no PR exists yet.',
+    state.prUrl
+      ? 'Takeover has a PR, but it is not completion-ready yet.'
+      : 'Takeover has implementation progress but no PR exists yet.',
     ...contextLines,
     nextAction,
-    'Do not leave validated work without a branch, commit, push, and PR.',
+    'Do not leave validated work without a branch, commit, push, and PR; do not open a PR from a stale or failing branch.',
   ].join(' ')
 
   for (const to of recipients) {
@@ -568,6 +805,13 @@ export async function runLocal(
         logCursor = nextLogs.cursor
         appendLogLines(localLogs, nextLogs.lines)
         let current = await collectLocalObservationState(runtime, worktreePath, localLogs)
+        const completionReason = getLocalCompletionReason(current)
+        if (completionReason) {
+          if (process.stdout.isTTY) logUpdate.clear()
+          console.log(`\n  [local] Takeover complete: ${completionReason}`)
+          previous = current
+          break
+        }
         const nudgedMission = await maybeNudgeLocalMissionControl(runtime, current, generated.intent, missionNudgeState).catch(() => false)
         if (nudgedMission) current = await collectLocalObservationState(runtime, worktreePath, localLogs)
         const scaled = await maybeScaleLocalWorkforce(runtime, current).catch(() => false)
@@ -587,13 +831,6 @@ export async function runLocal(
         fs.writeFileSync(liveDashboardPath, `${dashboardSnapshot}\n`)
         if (process.stdout.isTTY) {
           renderDashboard(dashboardState)
-        }
-
-        if (current.prUrl) {
-          if (process.stdout.isTTY) logUpdate.clear()
-          console.log(`\n  [local] Pull request created: ${current.prUrl}`)
-          previous = current
-          break
         }
 
         if (progressed) {
