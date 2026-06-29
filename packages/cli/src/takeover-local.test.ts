@@ -9,6 +9,7 @@ import {
   buildLocalDashboardState,
   buildPrNudgeSignature,
   collectPrNudgeRecipients,
+  createLocalExecutionWatchdogState,
   createRuntimeErrorGateState,
   ensureLocalCapsuleBranch,
   evaluateRuntimeErrorGate,
@@ -16,6 +17,7 @@ import {
   hasLocalProgress,
   materializeLocalTakeoverProject,
   maybeNudgeLocalPrExecution,
+  maybeNudgeStalledLocalExecution,
   parseLocalGitStatus,
   planLocalDynamicClone,
   recoverOrphanLocalTasks,
@@ -750,6 +752,100 @@ describe('maybeNudgeLocalPrExecution', () => {
         baseBehind: 0,
       }),
       {},
+    )).resolves.toBe(false)
+
+    expect(sendMessage).not.toHaveBeenCalled()
+  })
+})
+
+describe('maybeNudgeStalledLocalExecution', () => {
+  it('steers a dev worker that has tool activity but no observable output', async () => {
+    const sendMessage = vi.fn().mockResolvedValue(undefined)
+    const log = vi.fn()
+    const watchdogState = createLocalExecutionWatchdogState()
+    const previous = makeState({
+      health: {
+        agents: [
+          { name: 'dev', state: 'running', lifecycle: 'on-demand' },
+        ],
+      },
+      activeBranch: 'wanman/playable-rts',
+      tasks: [{ id: 'task-12345678', title: 'Implement playable RTS', status: 'in_progress', assignee: 'dev', priority: 1, capsuleId: 'capsule-1' }],
+    })
+    const current = makeState({
+      health: previous.health,
+      activeBranch: 'wanman/playable-rts',
+      tasks: previous.tasks,
+    })
+    const toolLog = JSON.stringify({
+      scope: 'agent-process',
+      msg: 'tool',
+      agent: 'dev',
+      tool: 'command_execution',
+      summary: 'pnpm test',
+    })
+
+    await expect(maybeNudgeStalledLocalExecution(
+      { sendMessage } as never,
+      previous,
+      current,
+      [toolLog],
+      watchdogState,
+      { stagnantPolls: 2, now: 1_000, log },
+    )).resolves.toBe(false)
+    await expect(maybeNudgeStalledLocalExecution(
+      { sendMessage } as never,
+      previous,
+      current,
+      [],
+      watchdogState,
+      { stagnantPolls: 2, now: 31_000, log },
+    )).resolves.toBe(true)
+
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      from: 'takeover-execution-watchdog',
+      to: 'dev',
+      priority: 'steer',
+    }))
+    expect(sendMessage.mock.calls[0]?.[0]?.payload).toContain('tool activity but no observable task, artifact, or worktree progress')
+    expect(sendMessage.mock.calls[0]?.[0]?.payload).toContain('pnpm test')
+    expect(sendMessage.mock.calls[0]?.[0]?.payload).toContain('wanman/playable-rts')
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('execution_watchdog_nudged'))
+  })
+
+  it('does not steer without tool activity, open implementation work, or while progress is visible', async () => {
+    const sendMessage = vi.fn().mockResolvedValue(undefined)
+    const watchdogState = createLocalExecutionWatchdogState()
+    const base = makeState({
+      health: {
+        agents: [{ name: 'dev', state: 'running', lifecycle: 'on-demand' }],
+      },
+      tasks: [{ id: 'task-1', title: 'Implement feature', status: 'in_progress', assignee: 'dev', priority: 1 }],
+    })
+
+    await expect(maybeNudgeStalledLocalExecution(
+      { sendMessage } as never,
+      base,
+      base,
+      [],
+      watchdogState,
+      { stagnantPolls: 1 },
+    )).resolves.toBe(false)
+    await expect(maybeNudgeStalledLocalExecution(
+      { sendMessage } as never,
+      base,
+      makeState({ ...base, modifiedFiles: ['src/app.ts'] }),
+      [JSON.stringify({ scope: 'agent-process', msg: 'tool', agent: 'dev', tool: 'command_execution' })],
+      watchdogState,
+      { stagnantPolls: 1 },
+    )).resolves.toBe(false)
+    await expect(maybeNudgeStalledLocalExecution(
+      { sendMessage } as never,
+      makeState({ tasks: [{ id: 'task-2', title: 'Write docs', status: 'in_progress', assignee: 'feedback', priority: 1 }] }),
+      makeState({ tasks: [{ id: 'task-2', title: 'Write docs', status: 'in_progress', assignee: 'feedback', priority: 1 }] }),
+      [JSON.stringify({ scope: 'agent-process', msg: 'tool', agent: 'feedback', tool: 'command_execution' })],
+      watchdogState,
+      { stagnantPolls: 1 },
     )).resolves.toBe(false)
 
     expect(sendMessage).not.toHaveBeenCalled()

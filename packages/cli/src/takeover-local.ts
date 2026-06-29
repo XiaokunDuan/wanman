@@ -35,6 +35,8 @@ const MAX_DEV_WORKERS = 3
 const SUCCESSFUL_CHECK_CONCLUSIONS = new Set(['success', 'skipped', 'neutral'])
 const MAX_RUNTIME_ERROR_RETRIES = 2
 const FALLBACK_BACKLOG_COMPLETED_CEO_RUNS = 2
+const EXECUTION_WATCHDOG_STALLED_POLLS = 6
+const EXECUTION_WATCHDOG_COOLDOWN_MS = 90_000
 
 type CheckState = 'success' | 'failure' | 'pending' | 'none' | 'unknown'
 
@@ -88,6 +90,21 @@ interface RuntimeErrorRecord {
   agent: string
   detail: string
   count: number
+}
+
+interface LocalToolActivity {
+  agent: string
+  tool: string
+  summary?: string
+}
+
+export interface LocalExecutionWatchdogState {
+  stagnantPollsByAgent: Record<string, number>
+  stagnantSinceByAgent: Record<string, number>
+  lastToolByAgent: Record<string, LocalToolActivity>
+  lastToolAtByAgent: Record<string, number>
+  lastSignature?: string
+  lastSentAt?: number
 }
 
 export interface RuntimeErrorGateState {
@@ -948,6 +965,176 @@ async function maybeNudgeLocalMissionControl(
 }
 
 /** @internal exported for testing */
+export function createLocalExecutionWatchdogState(): LocalExecutionWatchdogState {
+  return {
+    stagnantPollsByAgent: {},
+    stagnantSinceByAgent: {},
+    lastToolByAgent: {},
+    lastToolAtByAgent: {},
+  }
+}
+
+function extractStructuredToolActivity(line: string): LocalToolActivity | undefined {
+  try {
+    const parsed = JSON.parse(line) as Record<string, unknown>
+    if (parsed['scope'] !== 'agent-process') return undefined
+    if (parsed['msg'] !== 'tool' && parsed['msg'] !== 'tool_call') return undefined
+    const agent = typeof parsed['agent'] === 'string' ? parsed['agent'].trim() : ''
+    const tool = typeof parsed['tool'] === 'string' ? parsed['tool'].trim() : ''
+    if (!agent || !tool) return undefined
+    const summary = typeof parsed['summary'] === 'string'
+      ? parsed['summary'].trim().slice(0, 240)
+      : typeof parsed['input'] === 'string'
+        ? parsed['input'].trim().slice(0, 240)
+        : undefined
+    return summary ? { agent, tool, summary } : { agent, tool }
+  } catch {
+    return undefined
+  }
+}
+
+function extractTextToolActivity(line: string): LocalToolActivity | undefined {
+  const match = line.match(/agent-process tool(?:_call)? \(([^,]+), tool:([^)]+)\)(?::\s*(.+))?/)
+  if (!match) return undefined
+  const agent = match[1]?.trim()
+  const tool = match[2]?.trim()
+  if (!agent || !tool) return undefined
+  const summary = match[3]?.trim().slice(0, 240)
+  return summary ? { agent, tool, summary } : { agent, tool }
+}
+
+function extractLocalToolActivities(lines: string[]): LocalToolActivity[] {
+  return lines.flatMap(line => {
+    const structured = extractStructuredToolActivity(line)
+    if (structured) return [structured]
+    const text = extractTextToolActivity(line)
+    return text ? [text] : []
+  })
+}
+
+function isRunnableDevTask(task: TaskInfo): boolean {
+  return task.status !== 'done' && isDevWorker(task.assignee) && isImplementationTask(task)
+}
+
+function currentRunnableDevTasks(state: LocalObservationState): TaskInfo[] {
+  return state.tasks.filter(isRunnableDevTask)
+}
+
+function agentsWithOpenImplementationTasks(state: LocalObservationState): Set<string> {
+  return new Set(currentRunnableDevTasks(state).map(task => task.assignee!).filter(Boolean))
+}
+
+function agentCanReceiveWatchdogNudge(state: LocalObservationState, agent: string): boolean {
+  return state.health.agents.some(item => item.name === agent && (item.state === 'running' || item.state === 'idle'))
+}
+
+function buildExecutionWatchdogSignature(agent: string, state: LocalObservationState): string {
+  return JSON.stringify({
+    agent,
+    activeBranch: state.activeBranch ?? null,
+    modifiedFiles: state.modifiedFiles,
+    tasks: currentRunnableDevTasks(state)
+      .filter(task => task.assignee === agent)
+      .map(task => ({ id: task.id, status: task.status, capsuleId: task.capsuleId })),
+  })
+}
+
+/** @internal exported for testing */
+export async function maybeNudgeStalledLocalExecution(
+  runtime: Pick<RuntimeClient, 'sendMessage'>,
+  previous: LocalObservationState,
+  current: LocalObservationState,
+  logLines: string[],
+  watchdogState: LocalExecutionWatchdogState,
+  opts: {
+    stagnantPolls?: number
+    cooldownMs?: number
+    now?: number
+    log?: (message: string) => void
+  } = {},
+): Promise<boolean> {
+  const now = opts.now ?? Date.now()
+  for (const activity of extractLocalToolActivities(logLines)) {
+    watchdogState.lastToolByAgent[activity.agent] = activity
+    watchdogState.lastToolAtByAgent[activity.agent] = now
+  }
+
+  const openAgents = agentsWithOpenImplementationTasks(current)
+  for (const agent of Object.keys(watchdogState.stagnantPollsByAgent)) {
+    if (!openAgents.has(agent)) {
+      delete watchdogState.stagnantPollsByAgent[agent]
+      delete watchdogState.stagnantSinceByAgent[agent]
+    }
+  }
+
+  if (hasLocalProgress(previous, current)) {
+    for (const agent of openAgents) {
+      watchdogState.stagnantPollsByAgent[agent] = 0
+      delete watchdogState.stagnantSinceByAgent[agent]
+    }
+    return false
+  }
+
+  const stalledPolls = opts.stagnantPolls ?? EXECUTION_WATCHDOG_STALLED_POLLS
+  const cooldownMs = opts.cooldownMs ?? EXECUTION_WATCHDOG_COOLDOWN_MS
+  const candidates = [...openAgents]
+    .filter(agent => agentCanReceiveWatchdogNudge(current, agent))
+    .filter(agent => watchdogState.lastToolByAgent[agent])
+    .sort()
+
+  for (const agent of candidates) {
+    const nextPolls = (watchdogState.stagnantPollsByAgent[agent] ?? 0) + 1
+    watchdogState.stagnantPollsByAgent[agent] = nextPolls
+    const stagnantSince = watchdogState.stagnantSinceByAgent[agent] ?? now
+    watchdogState.stagnantSinceByAgent[agent] = stagnantSince
+    if ((watchdogState.lastToolAtByAgent[agent] ?? 0) < stagnantSince) continue
+    if (nextPolls < stalledPolls) continue
+
+    const signature = buildExecutionWatchdogSignature(agent, current)
+    if (watchdogState.lastSignature === signature && now - (watchdogState.lastSentAt ?? 0) < cooldownMs) {
+      continue
+    }
+
+    const lastTool = watchdogState.lastToolByAgent[agent]
+    if (!lastTool) continue
+
+    const agentTasks = currentRunnableDevTasks(current).filter(task => task.assignee === agent)
+    const taskSummary = agentTasks
+      .map(task => `${task.id.slice(0, 8)}:${task.status}:${task.title}`)
+      .join('; ')
+    const stalledSeconds = Math.max(1, Math.round((now - stagnantSince) / 1000))
+    const changedFiles = current.modifiedFiles.length > 0
+      ? `Current modified files: ${current.modifiedFiles.slice(0, 8).join(', ')}${current.modifiedFiles.length > 8 ? ', ...' : ''}.`
+      : 'Current worktree still has no modified files.'
+    const payload = [
+      `Execution watchdog: ${agent} has shown tool activity but no observable task, artifact, or worktree progress for about ${stalledSeconds}s.`,
+      `Last observed tool: ${lastTool.tool}${lastTool.summary ? ` (${lastTool.summary})` : ''}.`,
+      `Branch: ${current.activeBranch ?? 'unknown'}. ${changedFiles}`,
+      `Open assigned task(s): ${taskSummary || 'none'}.`,
+      'Recover now: run `wanman task list --assignee ' + agent + '`, inspect the task, make a concrete code or test change in the worktree, run the closest verification, then mark the task done only after verified changes exist.',
+      'If the task is blocked, mark it blocked with the exact blocker instead of continuing to run commands without changing the project.',
+    ].join(' ')
+
+    await runtime.sendMessage({
+      from: 'takeover-execution-watchdog',
+      to: agent,
+      type: 'message',
+      priority: 'steer',
+      payload,
+    }).catch(() => undefined)
+
+    watchdogState.lastSignature = signature
+    watchdogState.lastSentAt = now
+    watchdogState.stagnantPollsByAgent[agent] = 0
+    watchdogState.stagnantSinceByAgent[agent] = now
+    opts.log?.(`execution_watchdog_nudged agent=${agent} polls=${nextPolls} tasks=${agentTasks.map(task => task.id.slice(0, 8)).join(',') || 'none'}`)
+    return true
+  }
+
+  return false
+}
+
+/** @internal exported for testing */
 export async function maybeNudgeLocalPrExecution(
   runtime: RuntimeClient,
   state: LocalObservationState,
@@ -1158,6 +1345,7 @@ export async function runLocal(
       const prNudgeState: LocalPrNudgeState = {}
       const missionNudgeState: LocalMissionNudgeState = {}
       const fallbackBacklogState: LocalFallbackBacklogState = {}
+      const executionWatchdogState = createLocalExecutionWatchdogState()
       const runtimeErrorGate = createRuntimeErrorGateState()
       let lastPrintedSnapshot = ''
       let childExitCode: number | null = null
@@ -1226,6 +1414,9 @@ export async function runLocal(
         if (scaled) current = await collectLocalObservationState(runtime, worktreePath, localLogs)
         const nudgedPr = await maybeNudgeLocalPrExecution(runtime, current, prNudgeState).catch(() => false)
         if (nudgedPr) current = await collectLocalObservationState(runtime, worktreePath, localLogs)
+        await maybeNudgeStalledLocalExecution(runtime, previous, current, nextLogs.lines, executionWatchdogState, {
+          log: message => console.log(`  [local] ${message}`),
+        }).catch(() => false)
         const progressed = hasLocalProgress(previous, current)
         const dashboardMaxLoops = opts.infinite ? Math.max(observedLoops, 1) : opts.loops
         const dashboardState = buildLocalDashboardState(
