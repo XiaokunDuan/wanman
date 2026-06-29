@@ -393,7 +393,8 @@ export class AgentProcess {
     this._state = 'running';
     this.currentUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     const pending = await resolveMaybePromise(this.relay.recv(this.definition.name, 10));
-    if (pending.length === 0) {
+    const hasTaskWork = this.hasAutonomousWork?.(this.definition.name) ?? false;
+    if (pending.length === 0 && !hasTaskWork) {
       this.setIdleIfActive();
       log.info('no pending messages, skipping trigger', { agent: this.definition.name });
       return;
@@ -403,7 +404,9 @@ export class AgentProcess {
       const text = typeof m.payload === 'string' ? m.payload : JSON.stringify(m.payload);
       return `[${m.priority}/${m.type}] ${m.from}: ${text}`;
     }).join('\n');
-    let prompt = `You have been triggered. You have ${pending.length} pending message(s):\n\n${msgs}\n\nProcess these messages. Your task is complete once done.`;
+    let prompt = pending.length > 0
+      ? `You have been triggered. You have ${pending.length} pending message(s):\n\n${msgs}\n\nProcess these messages. Your task is complete once done.`
+      : `You have been triggered because runnable tasks are assigned to you. Run \`wanman task list --assignee ${this.definition.name}\`, move the assigned task in_progress, complete it, then mark it done.`;
 
     // Inject preamble context
     const preamble = this.preambleProvider

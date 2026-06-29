@@ -778,7 +778,6 @@ describe('takeoverCommand', () => {
     try {
       await takeoverCommand([
         tmpDir,
-        '--runtime', 'codex',
         '--goal', 'Custom OSS mission',
         '--dry-run',
         '--loops', '2',

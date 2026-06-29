@@ -9,12 +9,15 @@ import {
   buildLocalDashboardState,
   buildPrNudgeSignature,
   collectPrNudgeRecipients,
+  createRuntimeErrorGateState,
+  evaluateRuntimeErrorGate,
   getLocalCompletionReason,
   hasLocalProgress,
   materializeLocalTakeoverProject,
   maybeNudgeLocalPrExecution,
   parseLocalGitStatus,
   planLocalDynamicClone,
+  recoverOrphanLocalTasks,
 } from './takeover-local.js'
 import type { GeneratedAgentConfig, ProjectProfile } from './takeover-project.js'
 
@@ -130,6 +133,92 @@ describe('local takeover progress helpers', () => {
     appendLogLines(lines, [' first ', '', 'second', 'third'], 3)
 
     expect(lines).toEqual(['first', 'second', 'third'])
+  })
+
+  it('recovers implementation tasks that are pending without an assignee', async () => {
+    const updateTask = vi.fn().mockResolvedValue(undefined)
+    const sendMessage = vi.fn().mockResolvedValue(undefined)
+    const log = vi.fn()
+
+    await expect(recoverOrphanLocalTasks(
+      { updateTask, sendMessage },
+      makeState({
+        tasks: [
+          { id: '12345678-orphan', title: 'Implement playable match-3 game', status: 'pending', priority: 1 },
+          { id: '87654321-docs', title: 'Write notes', status: 'pending', priority: 5 },
+          { id: 'assigned', title: 'Fix UI', status: 'assigned', assignee: 'dev', priority: 2 },
+        ],
+      }),
+      { log },
+    )).resolves.toBe(true)
+
+    expect(updateTask).toHaveBeenCalledWith({
+      id: '12345678-orphan',
+      status: 'assigned',
+      assignee: 'dev',
+      agent: 'takeover-orphan-recovery',
+    })
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      from: 'takeover-orphan-recovery',
+      to: 'dev',
+      priority: 'steer',
+    }))
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('orphan_task_recovered'))
+    expect(updateTask).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not recover orphan tasks when the target worker is unavailable', async () => {
+    const updateTask = vi.fn().mockResolvedValue(undefined)
+    const sendMessage = vi.fn().mockResolvedValue(undefined)
+
+    await expect(recoverOrphanLocalTasks(
+      { updateTask, sendMessage },
+      makeState({
+        health: { agents: [{ name: 'ceo', state: 'idle', lifecycle: '24/7' }] },
+        tasks: [{ id: '12345678-orphan', title: 'Implement feature', status: 'pending', priority: 1 }],
+      }),
+    )).resolves.toBe(false)
+
+    expect(updateTask).not.toHaveBeenCalled()
+    expect(sendMessage).not.toHaveBeenCalled()
+  })
+
+  it('gates repeated runtime errors with bounded retries and fail-fast', () => {
+    const gate = createRuntimeErrorGateState()
+
+    expect(evaluateRuntimeErrorGate(gate, ['13:23 agent-process runtime_error (ceo)'])).toEqual({
+      failed: false,
+      retries: [{ agent: 'ceo', count: 1, detail: '13:23 agent-process runtime_error (ceo)' }],
+    })
+    expect(evaluateRuntimeErrorGate(gate, ['13:23 agent-process runtime_error (ceo)'])).toEqual({
+      failed: false,
+      retries: [],
+    })
+    expect(evaluateRuntimeErrorGate(gate, ['13:24 agent-process runtime_error (ceo)'])).toMatchObject({
+      failed: false,
+      retries: [{ agent: 'ceo', count: 2 }],
+    })
+    expect(evaluateRuntimeErrorGate(gate, ['13:25 agent-process runtime_error (ceo)'])).toMatchObject({
+      failed: true,
+      failure: { agent: 'ceo', count: 3 },
+    })
+  })
+
+  it('extracts runtime error agents from structured supervisor logs', () => {
+    const gate = createRuntimeErrorGateState()
+    const line = JSON.stringify({
+      ts: '2026-06-29T11:00:00.000Z',
+      level: 'warn',
+      scope: 'agent-process',
+      msg: 'runtime_error',
+      agent: 'dev',
+      detail: 'turn failed',
+    })
+
+    expect(evaluateRuntimeErrorGate(gate, [line])).toMatchObject({
+      failed: false,
+      retries: [{ agent: 'dev', count: 1 }],
+    })
   })
 
   it('builds dashboard state from local observation state', () => {

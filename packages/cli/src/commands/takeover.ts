@@ -80,7 +80,7 @@ running.
 
 Options:
   --goal <text>         Override auto-inferred long-running mission
-  --runtime <name>      Agent runtime: claude (default) or codex
+  --runtime <name>      Agent runtime: codex (default) or claude
   --codex-model <name>  Codex model override
   --codex-effort <lvl>  Codex reasoning effort: low|medium|high|xhigh
   --codex-speed <lvl>   Alias for --codex-effort using fast|balanced|deep|max
@@ -88,6 +88,7 @@ Options:
   --infinite            Run in infinite mode (default: true)
   --loops <n>           Run finite loops instead of infinite mode
   --poll <seconds>      Poll interval
+  --error-limit <n>     Runtime error retries before failing takeover (default: 2)
   --keep                Keep supervisor alive on exit
   --output <path>       Deliverables directory
   --no-brain            Disable db9 brain
@@ -103,7 +104,7 @@ function splitTakeoverArgs(args: string[]): {
   const projectPath = args[0]!
   const runArgs: string[] = []
   let goalOverride: string | undefined
-  let runtime: AgentRuntime = 'claude'
+  let runtime: AgentRuntime = 'codex'
   let dryRun = false
 
   for (let i = 1; i < args.length; i++) {
@@ -136,6 +137,10 @@ function splitTakeoverArgs(args: string[]): {
 
 function hasExplicitRunMode(runArgs: string[]): boolean {
   return runArgs.includes('--infinite') || runArgs.includes('--loops')
+}
+
+function hasExplicitErrorLimit(runArgs: string[]): boolean {
+  return runArgs.includes('--error-limit')
 }
 
 function printProjectSummary(profile: ProjectProfile, generated: GeneratedAgentConfig): void {
@@ -177,6 +182,7 @@ export async function takeoverCommand(args: string[]): Promise<void> {
   const previewGoal = generated.goal
   const normalizedRunArgs = hasExplicitRunMode(runArgs) ? runArgs : ['--infinite', ...runArgs]
   const { opts } = parseOptions([previewGoal, ...normalizedRunArgs])
+  if (!hasExplicitErrorLimit(runArgs)) opts.errorLimit = 2
   printProjectSummary(profile, generated)
 
   // Force infinite mode for takeover (parseOptions already sets loops=Infinity when --infinite)

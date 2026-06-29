@@ -33,6 +33,7 @@ import { formatDashboard, renderDashboard, type DashboardState } from './tui/das
 
 const MAX_DEV_WORKERS = 3
 const SUCCESSFUL_CHECK_CONCLUSIONS = new Set(['success', 'skipped', 'neutral'])
+const MAX_RUNTIME_ERROR_RETRIES = 2
 
 type CheckState = 'success' | 'failure' | 'pending' | 'none' | 'unknown'
 
@@ -80,6 +81,23 @@ interface LocalPullRequestState {
 interface LocalPrNudgeState {
   lastSignature?: string
   lastSentAt?: number
+}
+
+interface RuntimeErrorRecord {
+  agent: string
+  detail: string
+  count: number
+}
+
+export interface RuntimeErrorGateState {
+  seenLogLines: Set<string>
+  byAgent: Record<string, RuntimeErrorRecord>
+}
+
+export interface RuntimeErrorGateResult {
+  failed: boolean
+  retries: RuntimeErrorRecord[]
+  failure?: RuntimeErrorRecord
 }
 
 type LocalMissionNudgeState = MissionNudgeState
@@ -158,6 +176,52 @@ function snapshotWorktree(state: Pick<LocalObservationState, 'activeBranch' | 'b
     prUrl: state.prUrl,
     modifiedFiles: [...state.modifiedFiles].sort(),
   })
+}
+
+function parseRuntimeErrorLine(line: string): { agent: string; detail: string } | null {
+  if (!line.includes('runtime_error')) return null
+  try {
+    const parsed = JSON.parse(line) as { msg?: unknown; agent?: unknown }
+    if (parsed.msg === 'runtime_error') {
+      return {
+        agent: typeof parsed.agent === 'string' && parsed.agent.trim() ? parsed.agent : 'unknown',
+        detail: line.slice(0, 500),
+      }
+    }
+  } catch {
+    // Fall through to text log parsing.
+  }
+  const agentMatch = line.match(/\(([^)]+)\)/) ?? line.match(/agent[=:]([A-Za-z0-9_-]+)/)
+  const agent = agentMatch?.[1]?.trim() || 'unknown'
+  return { agent, detail: line.slice(0, 500) }
+}
+
+/** @internal exported for testing */
+export function createRuntimeErrorGateState(): RuntimeErrorGateState {
+  return { seenLogLines: new Set(), byAgent: {} }
+}
+
+/** @internal exported for testing */
+export function evaluateRuntimeErrorGate(
+  state: RuntimeErrorGateState,
+  logLines: string[],
+  maxRetries = MAX_RUNTIME_ERROR_RETRIES,
+): RuntimeErrorGateResult {
+  const retries: RuntimeErrorRecord[] = []
+  for (const line of logLines) {
+    if (state.seenLogLines.has(line)) continue
+    state.seenLogLines.add(line)
+    const parsed = parseRuntimeErrorLine(line)
+    if (!parsed) continue
+
+    const current = state.byAgent[parsed.agent] ?? { agent: parsed.agent, detail: parsed.detail, count: 0 }
+    current.count += 1
+    current.detail = parsed.detail
+    state.byAgent[parsed.agent] = current
+    if (current.count <= maxRetries) retries.push({ ...current })
+    else return { failed: true, retries, failure: { ...current } }
+  }
+  return { failed: false, retries }
 }
 
 function summarizeChecks(checks: Array<Record<string, unknown>>): CheckState {
@@ -454,6 +518,53 @@ function createLoggedLocalCoordinationBackend(runtime: RuntimeClient) {
       console.log(`  [local] ${message}`)
     },
   })
+}
+
+function isImplementationTask(task: TaskInfo): boolean {
+  const title = task.title.toLowerCase()
+  return task.capsuleId !== undefined
+    || /(implement|build|fix|add|update|refactor|test|game|ui|feature)/.test(title)
+}
+
+/** @internal exported for testing */
+export async function recoverOrphanLocalTasks(
+  runtime: Pick<RuntimeClient, 'updateTask' | 'sendMessage'>,
+  state: LocalObservationState,
+  opts: { assignee?: string; log?: (message: string) => void } = {},
+): Promise<boolean> {
+  const assignee = opts.assignee ?? 'dev'
+  const knownAgents = new Set(state.health.agents.map(agent => agent.name))
+  if (!knownAgents.has(assignee)) return false
+
+  const orphanTasks = state.tasks.filter(task => (
+    task.status === 'pending'
+    && !task.assignee
+    && isImplementationTask(task)
+  ))
+  if (orphanTasks.length === 0) return false
+
+  for (const task of orphanTasks) {
+    await runtime.updateTask({
+      id: task.id,
+      status: 'assigned',
+      assignee,
+      agent: 'takeover-orphan-recovery',
+    })
+    await runtime.sendMessage({
+      from: 'takeover-orphan-recovery',
+      to: assignee,
+      type: 'message',
+      priority: 'steer',
+      payload: [
+        `Recovered orphan task ${task.id.slice(0, 8)}: "${task.title}".`,
+        `The task was pending without an assignee, so local takeover assigned it to ${assignee}.`,
+        `Run \`wanman task list --assignee ${assignee}\`, mark it in_progress, implement within the task scope, verify, then mark it done.`,
+      ].join(' '),
+    })
+    opts.log?.(`orphan_task_recovered task=${task.id.slice(0, 8)} status=pending assignee=${assignee}`)
+  }
+
+  return true
 }
 
 export function planLocalDynamicClone(state: LocalObservationState) {
@@ -790,6 +901,7 @@ export async function runLocal(
       let lastProgressAt = Date.now()
       const prNudgeState: LocalPrNudgeState = {}
       const missionNudgeState: LocalMissionNudgeState = {}
+      const runtimeErrorGate = createRuntimeErrorGateState()
       let lastPrintedSnapshot = ''
       let childExitCode: number | null = null
       let childError: Error | null = null
@@ -805,6 +917,32 @@ export async function runLocal(
         logCursor = nextLogs.cursor
         appendLogLines(localLogs, nextLogs.lines)
         let current = await collectLocalObservationState(runtime, worktreePath, localLogs)
+        const runtimeErrors = evaluateRuntimeErrorGate(
+          runtimeErrorGate,
+          nextLogs.lines,
+          opts.errorLimit ?? MAX_RUNTIME_ERROR_RETRIES,
+        )
+        for (const retry of runtimeErrors.retries) {
+          await runtime.sendMessage({
+            from: 'takeover-runtime-error-gate',
+            to: retry.agent,
+            type: 'message',
+            priority: 'steer',
+            payload: `Runtime error observed for ${retry.agent} (${retry.count}/${opts.errorLimit ?? MAX_RUNTIME_ERROR_RETRIES}). Retry once from a clean task state. Last error: ${retry.detail}`,
+          }).catch(() => undefined)
+          console.log(`  [local] Runtime error retry ${retry.count}/${opts.errorLimit ?? MAX_RUNTIME_ERROR_RETRIES}: ${retry.agent}`)
+        }
+        if (runtimeErrors.failed && runtimeErrors.failure) {
+          const taskSummary = current.tasks
+            .map(task => `${task.id.slice(0, 8)}:${task.status}${task.assignee ? `->${task.assignee}` : ''}`)
+            .join(', ') || 'no tasks'
+          throw new Error([
+            `Local takeover stopped after repeated runtime_error from ${runtimeErrors.failure.agent}.`,
+            `count=${runtimeErrors.failure.count}`,
+            `last=${runtimeErrors.failure.detail}`,
+            `tasks=${taskSummary}`,
+          ].join(' '))
+        }
         const completionReason = getLocalCompletionReason(current)
         if (completionReason) {
           if (process.stdout.isTTY) logUpdate.clear()
@@ -814,6 +952,10 @@ export async function runLocal(
         }
         const nudgedMission = await maybeNudgeLocalMissionControl(runtime, current, generated.intent, missionNudgeState).catch(() => false)
         if (nudgedMission) current = await collectLocalObservationState(runtime, worktreePath, localLogs)
+        const recoveredOrphans = await recoverOrphanLocalTasks(runtime, current, {
+          log: message => console.log(`  [local] ${message}`),
+        }).catch(() => false)
+        if (recoveredOrphans) current = await collectLocalObservationState(runtime, worktreePath, localLogs)
         const scaled = await maybeScaleLocalWorkforce(runtime, current).catch(() => false)
         if (scaled) current = await collectLocalObservationState(runtime, worktreePath, localLogs)
         const nudgedPr = await maybeNudgeLocalPrExecution(runtime, current, prNudgeState).catch(() => false)

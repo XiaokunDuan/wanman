@@ -238,6 +238,32 @@ export class Supervisor {
       executionProfile: task.executionProfile,
     }, 'normal');
     log.info('auto-notified agent of task assignment', { agent, taskId: task.id });
+    this.wakeAgentForAssignedWork(agent, task.id, 'task_assignment');
+  }
+
+  private wakeAgentForAssignedWork(agentName: string, taskId: string, reason: string): void {
+    const agent = this.agents.get(agentName);
+    if (
+      !agent
+      || !(agent.definition.lifecycle === 'on-demand' || agent.definition.lifecycle === 'idle_cached')
+      || agent.state !== 'idle'
+      || typeof agent.trigger !== 'function'
+      || this.hasBlockedTasksOnly(agentName)
+    ) {
+      return;
+    }
+    log.info('waking idle agent for assigned task', {
+      agent: agentName,
+      taskId,
+      reason,
+      lifecycle: agent.definition.lifecycle,
+    });
+    void agent.trigger().catch((err) => {
+      log.error('agent trigger failed', {
+        agent: agentName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
   }
 
   private filterStaleTaskAssignmentMessages(agent: string, messages: AgentMessage[]): AgentMessage[] {
@@ -1119,6 +1145,8 @@ ${activePaths}`;
         if (assignee && assignee !== oldAssignee && updatedTask) {
           const from = (params as Record<string, unknown>)['from'] as string || 'system';
           this.notifyTaskAssignment(assignee, updatedTask, from);
+        } else if (status === 'assigned' && updatedTask?.assignee) {
+          this.wakeAgentForAssignedWork(updatedTask.assignee, updatedTask.id, 'task_status_assigned');
         }
 
         // Emit task transition event for observability
